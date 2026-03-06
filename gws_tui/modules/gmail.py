@@ -4,6 +4,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
+from typing import Any
 
 from gws_tui.client import GwsClient
 from gws_tui.models import Record
@@ -113,7 +114,10 @@ class GmailModule(WorkspaceModule):
                     title=subject,
                     subtitle=sender,
                     preview=preview,
-                    raw={"headers": headers},
+                    raw={
+                        "headers": headers,
+                        "label_ids": metadata.get("labelIds", []),
+                    },
                 )
             )
         return records
@@ -139,6 +143,41 @@ class GmailModule(WorkspaceModule):
             "send",
             params={"userId": "me"},
             body={"raw": self.build_raw_message(to=to, subject=subject, body=body)},
+        )
+
+    def list_user_labels(self, client: GwsClient) -> list[dict[str, Any]]:
+        response = client.run(
+            "gmail",
+            "users",
+            "labels",
+            "list",
+            params={"userId": "me"},
+        )
+        labels = response.get("labels", [])
+        return sorted(
+            [label for label in labels if label.get("type") == "USER"],
+            key=lambda label: label.get("name", "").lower(),
+        )
+
+    def update_message_labels(
+        self,
+        client: GwsClient,
+        message_id: str,
+        existing_label_ids: list[str],
+        selected_label_ids: list[str],
+    ) -> dict:
+        existing = set(existing_label_ids)
+        selected = set(selected_label_ids)
+        return client.run(
+            "gmail",
+            "users",
+            "messages",
+            "modify",
+            params={"userId": "me", "id": message_id},
+            body={
+                "addLabelIds": sorted(selected - existing),
+                "removeLabelIds": sorted(existing - selected),
+            },
         )
 
     def trash_message(self, client: GwsClient, message_id: str) -> dict:
@@ -169,6 +208,8 @@ class GmailModule(WorkspaceModule):
         recipient = header_value(headers, "To", "Unknown recipient")
         date = header_value(headers, "Date", "Unknown date")
         body = extract_body(payload).strip() or response.get("snippet") or "(No message body)"
+        label_ids = response.get("labelIds", [])
+        record.raw["label_ids"] = label_ids
         lines = [
             f"Subject: {subject}",
             f"From: {sender}",

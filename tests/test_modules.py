@@ -177,6 +177,40 @@ class GmailHelpersTest(unittest.TestCase):
 
         self.assertEqual(client.calls[-1][1], ("users", "messages", "trash"))
 
+    def test_list_user_labels_filters_to_custom_labels(self) -> None:
+        client = StubClient()
+        module = GmailModule()
+        client.add(
+            ("gmail", "users", "labels", "list", "[('userId', 'me')]"),
+            {
+                "labels": [
+                    {"id": "INBOX", "name": "INBOX", "type": "SYSTEM"},
+                    {"id": "Label_1", "name": "Projects", "type": "USER"},
+                    {"id": "Label_2", "name": "Alpha", "type": "USER"},
+                ]
+            },
+        )
+
+        labels = module.list_user_labels(client)  # type: ignore[arg-type]
+
+        self.assertEqual([label["name"] for label in labels], ["Alpha", "Projects"])
+
+    def test_update_message_labels_uses_modify_endpoint(self) -> None:
+        client = StubClient()
+        module = GmailModule()
+        client.add(("gmail", "users", "messages", "modify", "[('id', 'msg-1'), ('userId', 'me')]"), {"id": "msg-1"})
+
+        response = module.update_message_labels(
+            client,  # type: ignore[arg-type]
+            message_id="msg-1",
+            existing_label_ids=["Label_1"],
+            selected_label_ids=["Label_2"],
+        )
+
+        self.assertEqual(response["id"], "msg-1")
+        self.assertEqual(client.calls[-1][1], ("users", "messages", "modify"))
+        self.assertEqual(client.calls[-1][3], {"addLabelIds": ["Label_2"], "removeLabelIds": ["Label_1"]})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,7 +6,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, ScrollableContainer
 from textual.screen import ModalScreen
-from textual.widgets import Button, ContentSwitcher, DataTable, Footer, Header, Input, ListItem, ListView, Static, TextArea
+from textual.widgets import Button, Checkbox, ContentSwitcher, DataTable, Footer, Header, Input, ListItem, ListView, Static, TextArea
 
 from gws_tui.client import GwsClient, GwsError
 from gws_tui.models import Record
@@ -148,6 +148,47 @@ class ConfirmDeleteScreen(ModalScreen[bool]):
             self.dismiss(True)
             return
         self.dismiss(False)
+
+
+class LabelEditorScreen(ModalScreen[list[str] | None]):
+    """Edit custom Gmail labels for a selected message."""
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, subject: str, labels: list[dict], selected_label_ids: set[str]) -> None:
+        super().__init__()
+        self.subject = subject
+        self.labels = labels
+        self.selected_label_ids = selected_label_ids
+
+    def compose(self) -> ComposeResult:
+        with Container(id="labels-modal", classes="modal-window"):
+            yield Static("Edit Gmail Labels", classes="modal-title")
+            yield Static(self.subject or "(No subject)", classes="modal-subtitle")
+            with ScrollableContainer(id="labels-list"):
+                if not self.labels:
+                    yield Static("No custom Gmail labels found.", id="labels-empty")
+                for label in self.labels:
+                    yield Checkbox(
+                        label.get("name", label.get("id", "Unnamed label")),
+                        value=label.get("id") in self.selected_label_ids,
+                        name=label.get("id"),
+                    )
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel", id="labels-cancel")
+                yield Button("Apply", variant="primary", id="labels-apply")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "labels-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id != "labels-apply":
+            return
+        selected_ids = [checkbox.name for checkbox in self.query(Checkbox) if checkbox.value and checkbox.name]
+        self.dismiss(selected_ids)
 
 
 class ModuleView(ScrollableContainer):
@@ -400,7 +441,7 @@ class WorkspaceApp(App):
         height: 1fr;
     }
 
-    ComposeEmailScreen, CreateEventScreen, ConfirmDeleteScreen {
+    ComposeEmailScreen, CreateEventScreen, ConfirmDeleteScreen, LabelEditorScreen {
         align: center middle;
     }
 
@@ -447,6 +488,17 @@ class WorkspaceApp(App):
         margin-bottom: 1;
     }
 
+    #labels-list {
+        height: 14;
+        border: tall #343434;
+        padding: 1;
+        margin-bottom: 1;
+    }
+
+    #labels-empty {
+        color: #a8a8a8;
+    }
+
     #status {
         dock: bottom;
         height: 1;
@@ -462,6 +514,7 @@ class WorkspaceApp(App):
         ("a", "add_event", "Add Event"),
         ("c", "compose_email", "Compose"),
         ("d", "delete_email", "Trash"),
+        ("l", "edit_labels", "Labels"),
         ("tab", "next_module", "Next"),
         ("shift+tab", "previous_module", "Prev"),
     ]
@@ -485,7 +538,7 @@ class WorkspaceApp(App):
                         id="module-list",
                     )
                     yield Static(
-                        "Tab / Shift+Tab switch modules\nArrow keys move rows\nEnter loads full detail\na add calendar event\nc compose email\nd move to trash\nr refresh",
+                        "Tab / Shift+Tab switch modules\nArrow keys move rows\nEnter loads full detail\na add calendar event\nc compose email\nd move to trash\nl edit gmail labels\nr refresh",
                         id="sidebar-help",
                     )
                 with ContentSwitcher(initial=f"frame-{self.current_module_id}", id="content-switcher"):
@@ -536,6 +589,19 @@ class WorkspaceApp(App):
             self.update_status("Trash: no email selected")
             return
         self.push_screen(ConfirmDeleteScreen(record.title or "(No subject)"), lambda confirmed: self._handle_delete_result(confirmed, record.key))
+
+    def action_edit_labels(self) -> None:
+        gmail_module = self._current_gmail_module()
+        if gmail_module is None:
+            self.update_status("Labels are only available in Gmail")
+            return
+        record = self.module_views[self.current_module_id].current_record()
+        if record is None:
+            self.update_status("Labels: no email selected")
+            return
+        self.update_status("Loading Gmail labels...")
+        current_label_ids = set(record.raw.get("label_ids", []))
+        self._load_label_editor(gmail_module, record.key, record.title, current_label_ids)
 
     def action_next_module(self) -> None:
         module_list = self.query_one(ListView)
@@ -623,6 +689,25 @@ class WorkspaceApp(App):
         self.update_status("Moving email to trash...")
         self._delete_email(gmail_module, message_id)
 
+    def _handle_label_result(
+        self,
+        result: list[str] | None,
+        message_id: str,
+        existing_label_ids: list[str],
+    ) -> None:
+        if result is None:
+            self.update_status("Label edit cancelled")
+            return
+        if sorted(result) == sorted(existing_label_ids):
+            self.update_status("Labels unchanged")
+            return
+        gmail_module = self._current_gmail_module()
+        if gmail_module is None:
+            self.update_status("Labels are only available in Gmail")
+            return
+        self.update_status("Updating labels...")
+        self._update_labels(gmail_module, message_id, existing_label_ids, result)
+
     @work(thread=True, exclusive=True)
     def _create_event(
         self,
@@ -667,6 +752,60 @@ class WorkspaceApp(App):
             self.call_from_thread(self.update_status, f"Send failed: {exc}")
             return
         self.call_from_thread(self.update_status, "Email sent")
+        self.call_from_thread(self.module_views["gmail"].action_refresh)
+
+    @work(thread=True, exclusive=True)
+    def _load_label_editor(
+        self,
+        gmail_module: GmailModule,
+        message_id: str,
+        subject: str,
+        current_label_ids: set[str],
+    ) -> None:
+        try:
+            labels = gmail_module.list_user_labels(self.client)
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Labels failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Labels failed: {exc}")
+            return
+        self.call_from_thread(self._show_label_editor, message_id, subject, list(current_label_ids), labels)
+
+    def _show_label_editor(
+        self,
+        message_id: str,
+        subject: str,
+        existing_label_ids: list[str],
+        labels: list[dict],
+    ) -> None:
+        self.push_screen(
+            LabelEditorScreen(subject, labels, set(existing_label_ids)),
+            lambda result: self._handle_label_result(result, message_id, existing_label_ids),
+        )
+
+    @work(thread=True, exclusive=True)
+    def _update_labels(
+        self,
+        gmail_module: GmailModule,
+        message_id: str,
+        existing_label_ids: list[str],
+        selected_label_ids: list[str],
+    ) -> None:
+        try:
+            gmail_module.update_message_labels(
+                self.client,
+                message_id=message_id,
+                existing_label_ids=existing_label_ids,
+                selected_label_ids=selected_label_ids,
+            )
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Labels failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Labels failed: {exc}")
+            return
+        self.call_from_thread(self.update_status, "Labels updated")
         self.call_from_thread(self.module_views["gmail"].action_refresh)
 
     @work(thread=True, exclusive=True)
