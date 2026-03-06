@@ -4,6 +4,7 @@ import unittest
 from datetime import timezone
 
 from gws_tui.modules.calendar import CalendarModule, event_day_keys, format_event_time
+from gws_tui.modules.docs import DocsModule, extract_document_text
 from gws_tui.modules.gmail import GmailModule, extract_body, format_message_date, normalize_reply_subject
 
 
@@ -264,6 +265,100 @@ class GmailHelpersTest(unittest.TestCase):
         self.assertEqual(response["id"], "msg-1")
         self.assertEqual(client.calls[-1][1], ("users", "messages", "modify"))
         self.assertEqual(client.calls[-1][3], {"addLabelIds": ["Label_2"], "removeLabelIds": ["Label_1"]})
+
+
+class DocsModuleTest(unittest.TestCase):
+    def test_extract_document_text_collects_paragraphs(self) -> None:
+        text = extract_document_text(
+            {
+                "body": {
+                    "content": [
+                        {
+                            "paragraph": {
+                                "elements": [
+                                    {"textRun": {"content": "Hello "}},
+                                    {"textRun": {"content": "world\n"}},
+                                ]
+                            }
+                        },
+                        {
+                            "paragraph": {
+                                "elements": [
+                                    {"textRun": {"content": "Second paragraph\n"}},
+                                ]
+                            }
+                        },
+                    ]
+                }
+            }
+        )
+
+        self.assertEqual(text, "Hello world\n\nSecond paragraph")
+
+    def test_fetch_records_lists_recent_docs(self) -> None:
+        client = StubClient()
+        module = DocsModule()
+        client.add(
+            (
+                "drive",
+                "files",
+                "list",
+                "[('includeItemsFromAllDrives', True), ('orderBy', 'modifiedTime desc'), ('pageSize', 25), ('q', \"mimeType='application/vnd.google-apps.document' and trashed=false\"), ('supportsAllDrives', True)]",
+            ),
+            [
+                {
+                    "files": [
+                        {
+                            "id": "doc-1",
+                            "name": "Spec",
+                            "modifiedTime": "2026-03-06T18:00:00Z",
+                            "owners": [{"displayName": "Aimee"}],
+                            "webViewLink": "https://docs.google.com/document/d/doc-1/edit",
+                        }
+                    ]
+                }
+            ],
+        )
+
+        records = module.fetch_records(client)  # type: ignore[arg-type]
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].title, "Spec")
+        self.assertEqual(records[0].subtitle, "Aimee")
+
+    def test_fetch_detail_reads_document_text(self) -> None:
+        client = StubClient()
+        module = DocsModule()
+        client.add(
+            ("docs", "documents", "get", "[('documentId', 'doc-1'), ('includeTabsContent', False)]"),
+            {
+                "title": "Spec",
+                "body": {
+                    "content": [
+                        {
+                            "paragraph": {
+                                "elements": [
+                                    {"textRun": {"content": "Hello docs\n"}},
+                                ]
+                            }
+                        }
+                    ]
+                },
+            },
+        )
+
+        record = __import__("gws_tui.models", fromlist=["Record"]).Record(
+            key="doc-1",
+            columns=("Spec", "Aimee", "Mar 06 10:00 AM"),
+            title="Spec",
+            subtitle="Aimee",
+            raw={"webViewLink": "https://docs.google.com/document/d/doc-1/edit"},
+        )
+
+        detail = module.fetch_detail(client, record)
+
+        self.assertIn("Title: Spec", detail)
+        self.assertIn("Hello docs", detail)
 
 
 if __name__ == "__main__":
