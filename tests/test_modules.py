@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+from pathlib import Path
+import tempfile
 import unittest
 from datetime import timezone
 
@@ -165,11 +168,29 @@ class GmailHelpersTest(unittest.TestCase):
         module = GmailModule()
 
         raw = module.build_raw_message("to@example.com", "Hello", "Body text")
-        raw_bytes = __import__("base64").urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+        raw_bytes = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
         text = raw_bytes.decode("utf-8")
         self.assertIn("To: to@example.com", text)
         self.assertIn("Subject: Hello", text)
         self.assertIn("Body text", text)
+
+    def test_build_raw_message_includes_attachment(self) -> None:
+        module = GmailModule()
+        with tempfile.NamedTemporaryFile("w+b", suffix=".txt", delete=False) as handle:
+            handle.write(b"attachment body")
+            temp_path = Path(handle.name)
+        self.addCleanup(temp_path.unlink)
+
+        raw = module.build_raw_message(
+            "to@example.com",
+            "Hello",
+            "Body text",
+            attachment_paths=[str(temp_path)],
+        )
+        raw_bytes = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+        text = raw_bytes.decode("utf-8")
+        self.assertIn("multipart/mixed", text)
+        self.assertIn(f'filename="{temp_path.name}"', text)
 
     def test_normalize_reply_subject_prefixes_once(self) -> None:
         self.assertEqual(normalize_reply_subject("Hello"), "Re: Hello")
@@ -185,7 +206,7 @@ class GmailHelpersTest(unittest.TestCase):
             in_reply_to="<message-id@example.com>",
             references="<prev@example.com> <message-id@example.com>",
         )
-        raw_bytes = __import__("base64").urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+        raw_bytes = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
         text = raw_bytes.decode("utf-8")
         self.assertIn("In-Reply-To: <message-id@example.com>", text)
         self.assertIn("References: <prev@example.com> <message-id@example.com>", text)

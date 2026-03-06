@@ -33,6 +33,7 @@ class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
         initial_to: str = "",
         initial_subject: str = "",
         initial_body: str = "",
+        initial_attachments: str = "",
     ) -> None:
         super().__init__()
         self.title = title
@@ -41,6 +42,7 @@ class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
         self.initial_to = initial_to
         self.initial_subject = initial_subject
         self.initial_body = initial_body
+        self.initial_attachments = initial_attachments
 
     def compose(self) -> ComposeResult:
         with Container(id="compose-modal", classes="modal-window"):
@@ -48,6 +50,11 @@ class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
             yield Static(self.subtitle, classes="modal-subtitle")
             yield Input(value=self.initial_to, placeholder="recipient@example.com", id="compose-to")
             yield Input(value=self.initial_subject, placeholder="Subject", id="compose-subject")
+            yield Input(
+                value=self.initial_attachments,
+                placeholder="Optional attachments: /path/file.pdf, /path/image.png",
+                id="compose-attachments",
+            )
             yield TextArea(self.initial_body, id="compose-body")
             with Horizontal(classes="modal-actions"):
                 yield Button("Cancel", id="compose-cancel")
@@ -67,6 +74,7 @@ class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
             return
         to = self.query_one("#compose-to", Input).value.strip()
         subject = self.query_one("#compose-subject", Input).value.strip()
+        attachment_text = self.query_one("#compose-attachments", Input).value.strip()
         body = self.query_one("#compose-body", TextArea).text.strip()
         if not to:
             self.app.update_status("Compose: recipient is required")
@@ -80,7 +88,14 @@ class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
             self.app.update_status("Compose: body is required")
             self.query_one("#compose-body", TextArea).focus()
             return
-        self.dismiss({"to": to, "subject": subject, "body": body})
+        self.dismiss(
+            {
+                "to": to,
+                "subject": subject,
+                "body": body,
+                "attachments": attachment_text,
+            }
+        )
 
 
 class CreateEventScreen(ModalScreen[dict[str, str] | None]):
@@ -1025,7 +1040,13 @@ class WorkspaceApp(App):
             self.update_status("Compose is only available in Gmail")
             return
         self.update_status("Sending email...")
-        self._send_email(gmail_module, result["to"], result["subject"], result["body"])
+        self._send_email(
+            gmail_module,
+            result["to"],
+            result["subject"],
+            result["body"],
+            self._parse_attachment_paths(result.get("attachments", "")),
+        )
 
     def _handle_create_doc_result(self, result: dict[str, str] | None) -> None:
         if result is None:
@@ -1063,10 +1084,20 @@ class WorkspaceApp(App):
             to=result["to"],
             subject=result["subject"],
             body=result["body"],
+            attachment_paths=self._parse_attachment_paths(result.get("attachments", "")),
             thread_id=reply_context["thread_id"],
             in_reply_to=reply_context["in_reply_to"],
             references=reply_context["references"],
         )
+
+    def _parse_attachment_paths(self, value: str) -> list[str]:
+        paths: list[str] = []
+        for chunk in value.splitlines():
+            for part in chunk.split(","):
+                cleaned = part.strip()
+                if cleaned:
+                    paths.append(cleaned)
+        return paths
 
     def _handle_delete_result(self, confirmed: bool, message_id: str) -> None:
         if not confirmed:
@@ -1176,9 +1207,25 @@ class WorkspaceApp(App):
         self.call_from_thread(self.module_views["docs"].action_refresh)
 
     @work(thread=True, exclusive=True)
-    def _send_email(self, gmail_module: GmailModule, to: str, subject: str, body: str) -> None:
+    def _send_email(
+        self,
+        gmail_module: GmailModule,
+        to: str,
+        subject: str,
+        body: str,
+        attachment_paths: list[str],
+    ) -> None:
         try:
-            gmail_module.send_message(self.client, to=to, subject=subject, body=body)
+            gmail_module.send_message(
+                self.client,
+                to=to,
+                subject=subject,
+                body=body,
+                attachment_paths=attachment_paths,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            self.call_from_thread(self.update_status, f"Send failed: {exc}")
+            return
         except GwsError as exc:
             self.call_from_thread(self.update_status, f"Send failed: {exc.message}")
             return
@@ -1204,7 +1251,7 @@ class WorkspaceApp(App):
         self.push_screen(
             ComposeEmailScreen(
                 title="Reply Email",
-                subtitle="Send a threaded reply to the selected message.",
+                subtitle="Send a threaded reply. Optional attachments use local file paths.",
                 submit_label="Reply",
                 initial_to=reply_context["to"],
                 initial_subject=reply_context["subject"],
@@ -1220,6 +1267,7 @@ class WorkspaceApp(App):
         to: str,
         subject: str,
         body: str,
+        attachment_paths: list[str],
         thread_id: str,
         in_reply_to: str,
         references: str,
@@ -1230,10 +1278,14 @@ class WorkspaceApp(App):
                 to=to,
                 subject=subject,
                 body=body,
+                attachment_paths=attachment_paths,
                 thread_id=thread_id,
                 in_reply_to=in_reply_to,
                 references=references,
             )
+        except (FileNotFoundError, ValueError) as exc:
+            self.call_from_thread(self.update_status, f"Reply failed: {exc}")
+            return
         except GwsError as exc:
             self.call_from_thread(self.update_status, f"Reply failed: {exc.message}")
             return

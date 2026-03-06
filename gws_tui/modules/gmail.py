@@ -4,6 +4,8 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
+import mimetypes
+from pathlib import Path
 from typing import Any
 
 from gws_tui.client import GwsClient
@@ -76,11 +78,18 @@ class GmailModule(WorkspaceModule):
     columns = ("From", "Subject", "Date")
     empty_message = "No inbox messages found."
 
-    def build_raw_message(self, to: str, subject: str, body: str) -> str:
+    def build_raw_message(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        attachment_paths: list[str] | None = None,
+    ) -> str:
         message = EmailMessage()
         message["To"] = to
         message["Subject"] = subject
         message.set_content(body)
+        self._attach_files(message, attachment_paths or [])
         encoded = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
         return encoded.rstrip("=")
 
@@ -91,6 +100,7 @@ class GmailModule(WorkspaceModule):
         body: str,
         in_reply_to: str,
         references: str,
+        attachment_paths: list[str] | None = None,
     ) -> str:
         message = EmailMessage()
         message["To"] = to
@@ -98,8 +108,28 @@ class GmailModule(WorkspaceModule):
         message["In-Reply-To"] = in_reply_to
         message["References"] = references
         message.set_content(body)
+        self._attach_files(message, attachment_paths or [])
         encoded = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
         return encoded.rstrip("=")
+
+    def _attach_files(self, message: EmailMessage, attachment_paths: list[str]) -> None:
+        for attachment_path in attachment_paths:
+            path = Path(attachment_path).expanduser()
+            if not path.exists():
+                raise FileNotFoundError(f"Attachment not found: {path}")
+            if not path.is_file():
+                raise ValueError(f"Attachment is not a file: {path}")
+            content_type, _ = mimetypes.guess_type(path.name)
+            if content_type:
+                maintype, subtype = content_type.split("/", 1)
+            else:
+                maintype, subtype = "application", "octet-stream"
+            message.add_attachment(
+                path.read_bytes(),
+                maintype=maintype,
+                subtype=subtype,
+                filename=path.name,
+            )
 
     def fetch_records(self, client: GwsClient) -> list[Record]:
         response = client.run(
@@ -164,14 +194,28 @@ class GmailModule(WorkspaceModule):
             },
         )
 
-    def send_message(self, client: GwsClient, to: str, subject: str, body: str) -> dict:
+    def send_message(
+        self,
+        client: GwsClient,
+        to: str,
+        subject: str,
+        body: str,
+        attachment_paths: list[str] | None = None,
+    ) -> dict:
         return client.run(
             "gmail",
             "users",
             "messages",
             "send",
             params={"userId": "me"},
-            body={"raw": self.build_raw_message(to=to, subject=subject, body=body)},
+            body={
+                "raw": self.build_raw_message(
+                    to=to,
+                    subject=subject,
+                    body=body,
+                    attachment_paths=attachment_paths,
+                )
+            },
         )
 
     def fetch_reply_context(self, client: GwsClient, message_id: str) -> dict[str, str]:
@@ -215,6 +259,7 @@ class GmailModule(WorkspaceModule):
         thread_id: str,
         in_reply_to: str,
         references: str,
+        attachment_paths: list[str] | None = None,
     ) -> dict:
         return client.run(
             "gmail",
@@ -230,6 +275,7 @@ class GmailModule(WorkspaceModule):
                     body=body,
                     in_reply_to=in_reply_to,
                     references=references,
+                    attachment_paths=attachment_paths,
                 ),
             },
         )
