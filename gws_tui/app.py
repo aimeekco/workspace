@@ -8,6 +8,7 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, ScrollableContainer
+from textual.events import Key
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, ContentSwitcher, DataTable, Footer, Header, Input, ListItem, ListView, Static, TextArea
 
@@ -813,11 +814,14 @@ class WorkspaceApp(App):
                     yield Static("gws workspace", id="brand")
                     yield Static("Modules", classes="section-label")
                     yield ListView(
-                        *(ListItem(Static(module.title), name=module.id) for module in self.modules),
+                        *(
+                            ListItem(Static(f"{index}. {module.title}"), name=module.id)
+                            for index, module in enumerate(self.modules, start=1)
+                        ),
                         id="module-list",
                     )
                     yield Static(
-                        "Tab / Shift+Tab switch modules\nArrow keys move rows\nEnter loads full detail\na add calendar event\n[ / ] change month\nc compose email\nd move to trash\ne reply email\nl edit gmail labels\nn new doc\nw edit doc\nr refresh",
+                        "1-9 switch modules\nTab / Shift+Tab switch modules\nArrow keys move rows\nEnter loads full detail\na add calendar event\n[ / ] change month\nc compose email\nd move to trash\ne reply email\nl edit gmail labels\nn new doc\nw edit doc\nr refresh",
                         id="sidebar-help",
                     )
                 with ContentSwitcher(initial=f"frame-{self.current_module_id}", id="content-switcher"):
@@ -833,6 +837,21 @@ class WorkspaceApp(App):
         module_list = self.query_one(ListView)
         module_list.index = 0
         self._show_module(self.current_module_id)
+
+    def on_key(self, event: Key) -> None:
+        if not event.character or not event.character.isdigit():
+            return
+        if len(self.screen_stack) > 1:
+            return
+        if isinstance(self.focused, Input | TextArea):
+            return
+        index = int(event.character) - 1
+        if not 0 <= index < len(self.modules):
+            return
+        module_list = self.query_one(ListView)
+        module_list.index = index
+        self._show_module(self.modules[index].id)
+        event.stop()
 
     def update_status(self, message: str) -> None:
         self.query_one("#status", Static).update(message)

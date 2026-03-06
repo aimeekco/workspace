@@ -6,9 +6,9 @@ from .gmail import GmailModule
 
 def built_in_modules() -> list[WorkspaceModule]:
     return [
+        GmailModule(),
         CalendarModule(),
         DocsModule(),
-        GmailModule(),
     ]
 
 
