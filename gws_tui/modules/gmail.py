@@ -58,6 +58,17 @@ def extract_body(payload: dict) -> str:
         return ""
 
 
+def normalize_reply_subject(subject: str) -> str:
+    if subject.lower().startswith("re:"):
+        return subject
+    return f"Re: {subject}"
+
+
+def quote_text(value: str) -> str:
+    lines = value.splitlines() or [""]
+    return "\n".join("> " if line == "" else f"> {line}" for line in lines)
+
+
 class GmailModule(WorkspaceModule):
     id = "gmail"
     title = "Gmail"
@@ -69,6 +80,23 @@ class GmailModule(WorkspaceModule):
         message = EmailMessage()
         message["To"] = to
         message["Subject"] = subject
+        message.set_content(body)
+        encoded = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+        return encoded.rstrip("=")
+
+    def build_raw_reply_message(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        in_reply_to: str,
+        references: str,
+    ) -> str:
+        message = EmailMessage()
+        message["To"] = to
+        message["Subject"] = subject
+        message["In-Reply-To"] = in_reply_to
+        message["References"] = references
         message.set_content(body)
         encoded = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
         return encoded.rstrip("=")
@@ -117,6 +145,7 @@ class GmailModule(WorkspaceModule):
                     raw={
                         "headers": headers,
                         "label_ids": metadata.get("labelIds", []),
+                        "thread_id": metadata.get("threadId"),
                     },
                 )
             )
@@ -143,6 +172,66 @@ class GmailModule(WorkspaceModule):
             "send",
             params={"userId": "me"},
             body={"raw": self.build_raw_message(to=to, subject=subject, body=body)},
+        )
+
+    def fetch_reply_context(self, client: GwsClient, message_id: str) -> dict[str, str]:
+        response = client.run(
+            "gmail",
+            "users",
+            "messages",
+            "get",
+            params={
+                "userId": "me",
+                "id": message_id,
+                "format": "full",
+            },
+        )
+        payload = response.get("payload", {})
+        headers = payload.get("headers", [])
+        sender = header_value(headers, "Reply-To") or header_value(headers, "From", "")
+        subject = normalize_reply_subject(header_value(headers, "Subject", "No subject"))
+        sent_at = header_value(headers, "Date", "Unknown date")
+        message_id_header = header_value(headers, "Message-ID", "")
+        references = header_value(headers, "References", "").strip()
+        combined_references = " ".join(part for part in [references, message_id_header] if part).strip()
+        original_body = extract_body(payload).strip() or response.get("snippet") or ""
+        quoted = quote_text(original_body)
+        reply_body = f"\n\nOn {sent_at}, {header_value(headers, 'From', 'Unknown sender')} wrote:\n{quoted}".rstrip()
+        return {
+            "to": sender,
+            "subject": subject,
+            "body": reply_body,
+            "thread_id": response.get("threadId", ""),
+            "in_reply_to": message_id_header,
+            "references": combined_references or message_id_header,
+        }
+
+    def reply_to_message(
+        self,
+        client: GwsClient,
+        to: str,
+        subject: str,
+        body: str,
+        thread_id: str,
+        in_reply_to: str,
+        references: str,
+    ) -> dict:
+        return client.run(
+            "gmail",
+            "users",
+            "messages",
+            "send",
+            params={"userId": "me"},
+            body={
+                "threadId": thread_id,
+                "raw": self.build_raw_reply_message(
+                    to=to,
+                    subject=subject,
+                    body=body,
+                    in_reply_to=in_reply_to,
+                    references=references,
+                ),
+            },
         )
 
     def list_user_labels(self, client: GwsClient) -> list[dict[str, Any]]:

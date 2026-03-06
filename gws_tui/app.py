@@ -23,16 +23,33 @@ class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
 
     BINDINGS = [("escape", "cancel", "Cancel")]
 
+    def __init__(
+        self,
+        title: str = "Compose Email",
+        subtitle: str = "Send a plain text Gmail message.",
+        submit_label: str = "Send",
+        initial_to: str = "",
+        initial_subject: str = "",
+        initial_body: str = "",
+    ) -> None:
+        super().__init__()
+        self.title = title
+        self.subtitle = subtitle
+        self.submit_label = submit_label
+        self.initial_to = initial_to
+        self.initial_subject = initial_subject
+        self.initial_body = initial_body
+
     def compose(self) -> ComposeResult:
         with Container(id="compose-modal", classes="modal-window"):
-            yield Static("Compose Email", classes="modal-title")
-            yield Static("Send a plain text Gmail message.", classes="modal-subtitle")
-            yield Input(placeholder="recipient@example.com", id="compose-to")
-            yield Input(placeholder="Subject", id="compose-subject")
-            yield TextArea("", id="compose-body")
+            yield Static(self.title, classes="modal-title")
+            yield Static(self.subtitle, classes="modal-subtitle")
+            yield Input(value=self.initial_to, placeholder="recipient@example.com", id="compose-to")
+            yield Input(value=self.initial_subject, placeholder="Subject", id="compose-subject")
+            yield TextArea(self.initial_body, id="compose-body")
             with Horizontal(classes="modal-actions"):
                 yield Button("Cancel", id="compose-cancel")
-                yield Button("Send", variant="primary", id="compose-send")
+                yield Button(self.submit_label, variant="primary", id="compose-send")
 
     def on_mount(self) -> None:
         self.query_one("#compose-to", Input).focus()
@@ -699,6 +716,7 @@ class WorkspaceApp(App):
         ("a", "add_event", "Add Event"),
         ("c", "compose_email", "Compose"),
         ("d", "delete_email", "Trash"),
+        ("e", "reply_email", "Reply"),
         ("l", "edit_labels", "Labels"),
         ("[", "previous_calendar_month", "Prev Month"),
         ("]", "next_calendar_month", "Next Month"),
@@ -725,7 +743,7 @@ class WorkspaceApp(App):
                         id="module-list",
                     )
                     yield Static(
-                        "Tab / Shift+Tab switch modules\nArrow keys move rows\nEnter loads full detail\na add calendar event\n[ / ] change month\nc compose email\nd move to trash\nl edit gmail labels\nr refresh",
+                        "Tab / Shift+Tab switch modules\nArrow keys move rows\nEnter loads full detail\na add calendar event\n[ / ] change month\nc compose email\nd move to trash\ne reply email\nl edit gmail labels\nr refresh",
                         id="sidebar-help",
                     )
                 with ContentSwitcher(initial=f"frame-{self.current_module_id}", id="content-switcher"):
@@ -765,6 +783,18 @@ class WorkspaceApp(App):
             self.update_status("Compose is only available in Gmail")
             return
         self.push_screen(ComposeEmailScreen(), self._handle_compose_result)
+
+    def action_reply_email(self) -> None:
+        gmail_module = self._current_gmail_module()
+        if gmail_module is None:
+            self.update_status("Reply is only available in Gmail")
+            return
+        record = self.module_views[self.current_module_id].current_record()
+        if record is None:
+            self.update_status("Reply: no email selected")
+            return
+        self.update_status("Loading reply context...")
+        self._load_reply_context(gmail_module, record.key)
 
     def action_delete_email(self) -> None:
         gmail_module = self._current_gmail_module()
@@ -879,6 +909,25 @@ class WorkspaceApp(App):
         self.update_status("Sending email...")
         self._send_email(gmail_module, result["to"], result["subject"], result["body"])
 
+    def _handle_reply_result(self, result: dict[str, str] | None, reply_context: dict[str, str]) -> None:
+        if result is None:
+            self.update_status("Reply cancelled")
+            return
+        gmail_module = self._current_gmail_module()
+        if gmail_module is None:
+            self.update_status("Reply is only available in Gmail")
+            return
+        self.update_status("Sending reply...")
+        self._send_reply(
+            gmail_module,
+            to=result["to"],
+            subject=result["subject"],
+            body=result["body"],
+            thread_id=reply_context["thread_id"],
+            in_reply_to=reply_context["in_reply_to"],
+            references=reply_context["references"],
+        )
+
     def _handle_delete_result(self, confirmed: bool, message_id: str) -> None:
         if not confirmed:
             self.update_status("Delete cancelled")
@@ -953,6 +1002,61 @@ class WorkspaceApp(App):
             self.call_from_thread(self.update_status, f"Send failed: {exc}")
             return
         self.call_from_thread(self.update_status, "Email sent")
+        self.call_from_thread(self.module_views["gmail"].action_refresh)
+
+    @work(thread=True, exclusive=True)
+    def _load_reply_context(self, gmail_module: GmailModule, message_id: str) -> None:
+        try:
+            reply_context = gmail_module.fetch_reply_context(self.client, message_id)
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Reply failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Reply failed: {exc}")
+            return
+        self.call_from_thread(self._show_reply_screen, reply_context)
+
+    def _show_reply_screen(self, reply_context: dict[str, str]) -> None:
+        self.push_screen(
+            ComposeEmailScreen(
+                title="Reply Email",
+                subtitle="Send a threaded reply to the selected message.",
+                submit_label="Reply",
+                initial_to=reply_context["to"],
+                initial_subject=reply_context["subject"],
+                initial_body=reply_context["body"],
+            ),
+            lambda result: self._handle_reply_result(result, reply_context),
+        )
+
+    @work(thread=True, exclusive=True)
+    def _send_reply(
+        self,
+        gmail_module: GmailModule,
+        to: str,
+        subject: str,
+        body: str,
+        thread_id: str,
+        in_reply_to: str,
+        references: str,
+    ) -> None:
+        try:
+            gmail_module.reply_to_message(
+                self.client,
+                to=to,
+                subject=subject,
+                body=body,
+                thread_id=thread_id,
+                in_reply_to=in_reply_to,
+                references=references,
+            )
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Reply failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Reply failed: {exc}")
+            return
+        self.call_from_thread(self.update_status, "Reply sent")
         self.call_from_thread(self.module_views["gmail"].action_refresh)
 
     @work(thread=True, exclusive=True)

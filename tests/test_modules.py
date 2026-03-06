@@ -4,7 +4,7 @@ import unittest
 from datetime import timezone
 
 from gws_tui.modules.calendar import CalendarModule, event_day_keys, format_event_time
-from gws_tui.modules.gmail import GmailModule, extract_body, format_message_date
+from gws_tui.modules.gmail import GmailModule, extract_body, format_message_date, normalize_reply_subject
 
 
 class StubClient:
@@ -170,6 +170,26 @@ class GmailHelpersTest(unittest.TestCase):
         self.assertIn("Subject: Hello", text)
         self.assertIn("Body text", text)
 
+    def test_normalize_reply_subject_prefixes_once(self) -> None:
+        self.assertEqual(normalize_reply_subject("Hello"), "Re: Hello")
+        self.assertEqual(normalize_reply_subject("Re: Hello"), "Re: Hello")
+
+    def test_build_raw_reply_message_contains_thread_headers(self) -> None:
+        module = GmailModule()
+
+        raw = module.build_raw_reply_message(
+            to="from@example.com",
+            subject="Re: Hello",
+            body="Reply body",
+            in_reply_to="<message-id@example.com>",
+            references="<prev@example.com> <message-id@example.com>",
+        )
+        raw_bytes = __import__("base64").urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+        text = raw_bytes.decode("utf-8")
+        self.assertIn("In-Reply-To: <message-id@example.com>", text)
+        self.assertIn("References: <prev@example.com> <message-id@example.com>", text)
+        self.assertIn("Reply body", text)
+
     def test_send_message_uses_send_endpoint(self) -> None:
         client = StubClient()
         module = GmailModule()
@@ -180,6 +200,26 @@ class GmailHelpersTest(unittest.TestCase):
         self.assertEqual(response["id"], "sent-1")
         self.assertEqual(client.calls[-1][0], "gmail")
         self.assertEqual(client.calls[-1][1], ("users", "messages", "send"))
+        self.assertIn("raw", client.calls[-1][3])
+
+    def test_reply_to_message_uses_send_endpoint_with_thread_id(self) -> None:
+        client = StubClient()
+        module = GmailModule()
+        client.add(("gmail", "users", "messages", "send", "[('userId', 'me')]"), {"id": "reply-1"})
+
+        response = module.reply_to_message(  # type: ignore[arg-type]
+            client,
+            to="from@example.com",
+            subject="Re: Hello",
+            body="Reply body",
+            thread_id="thread-1",
+            in_reply_to="<message-id@example.com>",
+            references="<message-id@example.com>",
+        )
+
+        self.assertEqual(response["id"], "reply-1")
+        self.assertEqual(client.calls[-1][1], ("users", "messages", "send"))
+        self.assertEqual(client.calls[-1][3]["threadId"], "thread-1")
         self.assertIn("raw", client.calls[-1][3])
 
     def test_trash_message_uses_trash_endpoint(self) -> None:
