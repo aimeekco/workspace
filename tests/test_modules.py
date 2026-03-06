@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from datetime import timezone
 
-from gws_tui.modules.calendar import CalendarModule, format_event_time
+from gws_tui.modules.calendar import CalendarModule, event_day_keys, format_event_time
 from gws_tui.modules.gmail import GmailModule, extract_body, format_message_date
 
 
@@ -32,13 +33,15 @@ class CalendarModuleTest(unittest.TestCase):
         module = CalendarModule()
 
         client.add(
-            ("calendar", "calendarList", "list", "[('maxResults', 12), ('showHidden', False)]"),
-            {
-                "items": [
-                    {"id": "primary", "summary": "Primary", "primary": True},
-                    {"id": "team", "summary": "Team"},
-                ]
-            },
+            ("calendar", "calendarList", "list", "[('maxResults', 250), ('showHidden', False)]"),
+            [
+                {
+                    "items": [
+                        {"id": "primary", "summary": "Primary", "primary": True},
+                        {"id": "team", "summary": "Team"},
+                    ]
+                }
+            ],
         )
 
         client.add(
@@ -54,12 +57,12 @@ class CalendarModuleTest(unittest.TestCase):
                             "orderBy": "startTime",
                             "timeMin": "<dynamic>",
                             "timeMax": "<dynamic>",
-                            "maxResults": 10,
+                            "maxResults": 250,
                         }.items()
                     )
                 ),
             ),
-            {"items": [{"id": "1", "summary": "Standup", "start": {"dateTime": "2026-03-07T10:00:00Z"}}]},
+            [{"items": [{"id": "1", "summary": "Standup", "start": {"dateTime": "2026-03-07T10:00:00Z"}}]}],
         )
         client.add(
             (
@@ -74,12 +77,12 @@ class CalendarModuleTest(unittest.TestCase):
                             "orderBy": "startTime",
                             "timeMin": "<dynamic>",
                             "timeMax": "<dynamic>",
-                            "maxResults": 10,
+                            "maxResults": 250,
                         }.items()
                     )
                 ),
             ),
-            {"items": [{"id": "2", "summary": "Retro", "start": {"dateTime": "2026-03-08T10:00:00Z"}}]},
+            [{"items": [{"id": "2", "summary": "Retro", "start": {"dateTime": "2026-03-08T10:00:00Z"}}]}],
         )
 
         records = module.fetch_records(client)  # type: ignore[arg-type]
@@ -87,6 +90,7 @@ class CalendarModuleTest(unittest.TestCase):
         self.assertEqual(len(records), 2)
         self.assertEqual(records[0].title, "Standup")
         self.assertEqual(records[1].subtitle, "Team")
+        self.assertEqual(records[0].raw["day_keys"], ["2026-03-07"])
 
     def test_format_event_time_handles_all_day_events(self) -> None:
         self.assertEqual(format_event_time({"start": {"date": "2026-03-09"}}), "2026-03-09 all day")
@@ -130,6 +134,16 @@ class CalendarModuleTest(unittest.TestCase):
         self.assertEqual(client.calls[-1][1], ("events", "insert"))
         self.assertEqual(client.calls[-1][2], {"calendarId": "primary", "sendUpdates": "none"})
         self.assertEqual(client.calls[-1][3]["summary"], "Planning")
+
+    def test_event_day_keys_spans_multi_day_all_day_event(self) -> None:
+        keys = event_day_keys(
+            {
+                "start": {"date": "2026-03-06"},
+                "end": {"date": "2026-03-09"},
+            }
+        )
+
+        self.assertEqual(keys, ["2026-03-06", "2026-03-07", "2026-03-08"])
 
 
 class GmailHelpersTest(unittest.TestCase):

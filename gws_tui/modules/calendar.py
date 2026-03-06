@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import calendar as calendar_lib
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from html import unescape
 import re
+from typing import Any
 
 from gws_tui.client import GwsClient
 from gws_tui.models import Record
@@ -50,6 +52,47 @@ def event_sort_key(event: dict) -> tuple[int, str]:
     start = event.get("start", {})
     raw = start.get("dateTime") or start.get("date") or "9999-12-31"
     return (0 if event.get("status") != "cancelled" else 1, raw)
+
+
+def event_day_key(event: dict) -> str:
+    start = event.get("start", {})
+    if "date" in start:
+        return start["date"]
+    start_time = parse_rfc3339(start.get("dateTime"))
+    if start_time is None:
+        return ""
+    return start_time.astimezone().date().isoformat()
+
+
+def event_day_keys(event: dict) -> list[str]:
+    start = event.get("start", {})
+    end = event.get("end", {})
+
+    if "date" in start:
+        start_day = date.fromisoformat(start["date"])
+        end_day = date.fromisoformat(end.get("date", start["date"])) - timedelta(days=1)
+    else:
+        start_time = parse_rfc3339(start.get("dateTime"))
+        end_time = parse_rfc3339(end.get("dateTime"))
+        if start_time is None:
+            return []
+        start_day = start_time.astimezone().date()
+        if end_time is None:
+            end_day = start_day
+        else:
+            # Calendar timed events use exclusive end times.
+            exclusive_end = end_time.astimezone()
+            end_day = (exclusive_end - timedelta(microseconds=1)).date()
+
+    if end_day < start_day:
+        end_day = start_day
+
+    keys: list[str] = []
+    current = start_day
+    while current <= end_day:
+        keys.append(current.isoformat())
+        current += timedelta(days=1)
+    return keys
 
 
 class CalendarModule(WorkspaceModule):
@@ -108,15 +151,23 @@ class CalendarModule(WorkspaceModule):
         )
 
     def fetch_records(self, client: GwsClient) -> list[Record]:
+        today = date.today()
+        return self.fetch_month_records(client, today.year, today.month)
+
+    def fetch_month_records(self, client: GwsClient, year: int, month: int) -> list[Record]:
         calendars_response = client.run(
             "calendar",
             "calendarList",
             "list",
-            params={"maxResults": 12, "showHidden": False},
+            params={"maxResults": 250, "showHidden": False},
+            page_all=True,
         )
-        calendars = calendars_response.get("items", [])
-        window_start = datetime.now(UTC)
-        window_end = window_start + timedelta(days=14)
+        calendars = self._collect_items(calendars_response, "items")
+        window_start = datetime(year, month, 1, tzinfo=UTC)
+        if month == 12:
+            window_end = datetime(year + 1, 1, 1, tzinfo=UTC)
+        else:
+            window_end = datetime(year, month + 1, 1, tzinfo=UTC)
         calendar_records: list[Record] = []
 
         ordered_calendars = sorted(
@@ -136,7 +187,10 @@ class CalendarModule(WorkspaceModule):
             calendar_records.extend(batch)
 
         calendar_records.sort(key=lambda record: event_sort_key(record.raw["event"]))
-        return calendar_records[:40]
+        return calendar_records
+
+    def month_matrix(self, year: int, month: int) -> list[list[date]]:
+        return calendar_lib.Calendar(firstweekday=6).monthdatescalendar(year, month)
 
     def _fetch_calendar_records(
         self,
@@ -157,11 +211,12 @@ class CalendarModule(WorkspaceModule):
                 "orderBy": "startTime",
                 "timeMin": window_start.isoformat().replace("+00:00", "Z"),
                 "timeMax": window_end.isoformat().replace("+00:00", "Z"),
-                "maxResults": 10,
+                "maxResults": 250,
             },
+            page_all=True,
         )
         records: list[Record] = []
-        for event in events_response.get("items", []):
+        for event in self._collect_items(events_response, "items"):
             if event.get("status") == "cancelled":
                 continue
             summary = event.get("summary") or "(No title)"
@@ -188,6 +243,8 @@ class CalendarModule(WorkspaceModule):
                     subtitle=calendar_name,
                     preview=preview,
                     raw={
+                        "day_key": event_day_key(event),
+                        "day_keys": event_day_keys(event),
                         "calendar_id": calendar_id,
                         "calendar_name": calendar_name,
                         "event": event,
@@ -195,6 +252,14 @@ class CalendarModule(WorkspaceModule):
                 )
             )
         return records
+
+    def _collect_items(self, response: dict[str, Any] | list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+        if isinstance(response, list):
+            items: list[dict[str, Any]] = []
+            for page in response:
+                items.extend(page.get(key, []))
+            return items
+        return response.get(key, [])
 
     def fetch_detail(self, client: GwsClient, record: Record) -> str:
         event = client.run(

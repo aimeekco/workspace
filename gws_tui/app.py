@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import calendar as calendar_lib
+from datetime import date
+
 from rich.panel import Panel
 from rich.text import Text
 from textual import work
@@ -189,6 +192,184 @@ class LabelEditorScreen(ModalScreen[list[str] | None]):
             return
         selected_ids = [checkbox.name for checkbox in self.query(Checkbox) if checkbox.value and checkbox.name]
         self.dismiss(selected_ids)
+
+
+class CalendarGridView(ScrollableContainer):
+    """Month-style calendar grid for the Calendar module."""
+
+    def __init__(self, module: CalendarModule, client: GwsClient) -> None:
+        super().__init__(id=f"view-{module.id}")
+        self.module = module
+        self.client = client
+        self.month_anchor = date.today().replace(day=1)
+        self.day_records: dict[str, list[Record]] = {}
+        self.coordinate_day: dict[tuple[int, int], date | None] = {}
+        self.loaded = False
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.module.title, classes="module-title")
+        yield Static(self.module.description, classes="module-description")
+        yield Static("", id="calendar-month-label", classes="pane-title")
+        with Horizontal(classes="module-body"):
+            with Container(classes="pane pane-table"):
+                yield Static("Month", classes="pane-title")
+                yield DataTable(id="calendar-grid")
+            with Container(classes="pane pane-detail"):
+                yield Static("Day Agenda", id="detail-label-calendar", classes="pane-title")
+                with ScrollableContainer(classes="detail-container"):
+                    yield Static("Select a day to view events.", id="detail-calendar")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#calendar-grid", DataTable)
+        table.cursor_type = "cell"
+        table.zebra_stripes = False
+        table.add_columns("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
+
+    def load_if_needed(self) -> None:
+        if not self.loaded:
+            self.action_refresh()
+
+    def action_refresh(self) -> None:
+        self.loaded = True
+        self._set_detail_text("Loading calendar...")
+        self.app.update_status("Loading calendar...")
+        self._load_month()
+
+    def action_next_month(self) -> None:
+        year = self.month_anchor.year + (1 if self.month_anchor.month == 12 else 0)
+        month = 1 if self.month_anchor.month == 12 else self.month_anchor.month + 1
+        self.month_anchor = date(year, month, 1)
+        self.action_refresh()
+
+    def action_previous_month(self) -> None:
+        year = self.month_anchor.year - (1 if self.month_anchor.month == 1 else 0)
+        month = 12 if self.month_anchor.month == 1 else self.month_anchor.month - 1
+        self.month_anchor = date(year, month, 1)
+        self.action_refresh()
+
+    @work(thread=True, exclusive=True)
+    def _load_month(self) -> None:
+        try:
+            records = self.module.fetch_month_records(self.client, self.month_anchor.year, self.month_anchor.month)
+        except GwsError as exc:
+            self.app.call_from_thread(self._handle_error, exc.message)
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.app.call_from_thread(self._handle_error, str(exc))
+            return
+        self.app.call_from_thread(self._render_month, records)
+
+    def _render_month(self, records: list[Record]) -> None:
+        self.day_records = {}
+        for record in records:
+            day_keys = record.raw.get("day_keys") or []
+            for day_key in day_keys:
+                self.day_records.setdefault(day_key, []).append(record)
+
+        month_label = f"{calendar_lib.month_name[self.month_anchor.month]} {self.month_anchor.year}   [ / ] to change month"
+        self.query_one("#calendar-month-label", Static).update(month_label)
+
+        table = self.query_one("#calendar-grid", DataTable)
+        table.clear()
+        self.coordinate_day = {}
+        month_matrix = self.module.month_matrix(self.month_anchor.year, self.month_anchor.month)
+        for row_index, week in enumerate(month_matrix):
+            row_values: list[str] = []
+            for column_index, current_day in enumerate(week):
+                self.coordinate_day[(row_index, column_index)] = current_day if current_day.month == self.month_anchor.month else None
+                row_values.append(self._format_day_cell(current_day))
+            table.add_row(*row_values, height=5)
+
+        today = date.today()
+        selected_row = 0
+        selected_column = 0
+        found_selection = False
+        for row_index, week in enumerate(month_matrix):
+            for column_index, current_day in enumerate(week):
+                if current_day == today and current_day.month == self.month_anchor.month:
+                    selected_row = row_index
+                    selected_column = column_index
+                    found_selection = True
+                    break
+            if found_selection:
+                break
+        if not found_selection:
+            for row_index, week in enumerate(month_matrix):
+                for column_index, current_day in enumerate(week):
+                    if current_day.month == self.month_anchor.month:
+                        selected_row = row_index
+                        selected_column = column_index
+                        found_selection = True
+                        break
+                if found_selection:
+                    break
+        table.move_cursor(row=selected_row, column=selected_column)
+        selected_day = self.coordinate_day.get((selected_row, selected_column))
+        self._show_day_preview(selected_day)
+        self.app.update_status(f"Calendar: loaded {calendar_lib.month_name[self.month_anchor.month]} {self.month_anchor.year}")
+
+    def _format_day_cell(self, current_day: date) -> str:
+        day_label = f"{current_day.day}"
+        if current_day.month != self.month_anchor.month:
+            return day_label
+        entries = self.day_records.get(current_day.isoformat(), [])
+        event_lines = [self._truncate_event(record.title) for record in entries[:2]]
+        if len(entries) > 2:
+            event_lines.append(f"+{len(entries) - 2} more")
+        content = [day_label, *event_lines]
+        return "\n".join(content)
+
+    def _truncate_event(self, title: str) -> str:
+        if len(title) <= 16:
+            return title
+        return f"{title[:13]}..."
+
+    def _show_day_preview(self, selected_day: date | None) -> None:
+        self.query_one("#detail-label-calendar", Static).update("Day Agenda")
+        if selected_day is None:
+            self._set_detail_text("This day is outside the current month.")
+            return
+        records = self.day_records.get(selected_day.isoformat(), [])
+        if not records:
+            self._set_detail_text(f"{selected_day.strftime('%A, %B %d')}\n\nNo events.")
+            return
+        lines = [selected_day.strftime("%A, %B %d"), ""]
+        for record in records:
+            event = record.raw["event"]
+            lines.append(f"{record.title}")
+            lines.append(f"{record.subtitle}  {self.module.columns[0]}: {record.columns[0]}")
+            if record.columns[3]:
+                lines.append(f"Location: {record.columns[3]}")
+            lines.append("")
+        self._set_detail_text("\n".join(lines).rstrip())
+        self.app.update_status("Calendar: day preview ready")
+
+    def _handle_error(self, message: str) -> None:
+        table = self.query_one("#calendar-grid", DataTable)
+        table.clear()
+        self._set_detail_text(f"Error: {message}")
+        self.app.update_status("Calendar: request failed")
+
+    def _set_detail_text(self, value: str) -> None:
+        self.query_one("#detail-calendar", Static).update(Panel(Text(value), title="Calendar"))
+
+    def on_data_table_cell_highlighted(self, event: DataTable.CellHighlighted) -> None:
+        if event.data_table.id != "calendar-grid":
+            return
+        self._show_day_preview(self.coordinate_day.get((event.coordinate.row, event.coordinate.column)))
+
+    def on_data_table_cell_selected(self, event: DataTable.CellSelected) -> None:
+        if event.data_table.id != "calendar-grid":
+            return
+        self._show_day_preview(self.coordinate_day.get((event.coordinate.row, event.coordinate.column)))
+
+    def current_record(self) -> Record | None:
+        table = self.query_one("#calendar-grid", DataTable)
+        selected_day = self.coordinate_day.get((table.cursor_coordinate.row, table.cursor_coordinate.column))
+        if selected_day is None:
+            return None
+        records = self.day_records.get(selected_day.isoformat(), [])
+        return records[0] if records else None
 
 
 class ModuleView(ScrollableContainer):
@@ -437,6 +618,10 @@ class WorkspaceApp(App):
         background: #1b1b1b;
     }
 
+    #calendar-grid {
+        height: 1fr;
+    }
+
     .detail-container {
         height: 1fr;
     }
@@ -515,6 +700,8 @@ class WorkspaceApp(App):
         ("c", "compose_email", "Compose"),
         ("d", "delete_email", "Trash"),
         ("l", "edit_labels", "Labels"),
+        ("[", "previous_calendar_month", "Prev Month"),
+        ("]", "next_calendar_month", "Next Month"),
         ("tab", "next_module", "Next"),
         ("shift+tab", "previous_module", "Prev"),
     ]
@@ -538,12 +725,12 @@ class WorkspaceApp(App):
                         id="module-list",
                     )
                     yield Static(
-                        "Tab / Shift+Tab switch modules\nArrow keys move rows\nEnter loads full detail\na add calendar event\nc compose email\nd move to trash\nl edit gmail labels\nr refresh",
+                        "Tab / Shift+Tab switch modules\nArrow keys move rows\nEnter loads full detail\na add calendar event\n[ / ] change month\nc compose email\nd move to trash\nl edit gmail labels\nr refresh",
                         id="sidebar-help",
                     )
                 with ContentSwitcher(initial=f"frame-{self.current_module_id}", id="content-switcher"):
                     for module in self.modules:
-                        view = ModuleView(module, self.client)
+                        view = CalendarGridView(module, self.client) if isinstance(module, CalendarModule) else ModuleView(module, self.client)
                         self.module_views[module.id] = view
                         with Container(id=f"frame-{module.id}", classes="module-frame"):
                             yield view
@@ -611,6 +798,20 @@ class WorkspaceApp(App):
         next_index = (module_list.index + 1) % len(self.modules)
         module_list.index = next_index
         self._show_module(self.modules[next_index].id)
+
+    def action_previous_calendar_month(self) -> None:
+        if self.current_module_id != "calendar":
+            return
+        view = self.module_views.get("calendar")
+        if isinstance(view, CalendarGridView):
+            view.action_previous_month()
+
+    def action_next_calendar_month(self) -> None:
+        if self.current_module_id != "calendar":
+            return
+        view = self.module_views.get("calendar")
+        if isinstance(view, CalendarGridView):
+            view.action_next_month()
 
     def action_previous_module(self) -> None:
         module_list = self.query_one(ListView)
