@@ -228,6 +228,40 @@ class LabelEditorScreen(ModalScreen[list[str] | None]):
         self.dismiss(selected_ids)
 
 
+class GmailSearchScreen(ModalScreen[str | None]):
+    """Set the Gmail search query for the current module."""
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, initial_query: str) -> None:
+        super().__init__()
+        self.initial_query = initial_query
+
+    def compose(self) -> ComposeResult:
+        with Container(id="gmail-search-modal", classes="modal-window"):
+            yield Static("Search Gmail", classes="modal-title")
+            yield Static("Blank query resets to inbox. Gmail search syntax is supported.", classes="modal-subtitle")
+            yield Input(value=self.initial_query, placeholder="from:someone@example.com has:attachment", id="gmail-search-query")
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel", id="gmail-search-cancel")
+                yield Button("Apply", variant="primary", id="gmail-search-apply")
+
+    def on_mount(self) -> None:
+        self.query_one("#gmail-search-query", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "gmail-search-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id != "gmail-search-apply":
+            return
+        query = self.query_one("#gmail-search-query", Input).value.strip()
+        self.dismiss(query)
+
+
 class CreateDocumentScreen(ModalScreen[dict[str, str] | None]):
     """Create a Google Doc."""
 
@@ -490,8 +524,8 @@ class ModuleView(ScrollableContainer):
         self.loaded = False
 
     def compose(self) -> ComposeResult:
-        yield Static(self.module.title, classes="module-title")
-        yield Static(self.module.description, classes="module-description")
+        yield Static(self.module.title, id=f"title-{self.module.id}", classes="module-title")
+        yield Static(self.module.subtitle(), id=f"description-{self.module.id}", classes="module-description")
         with Horizontal(classes="module-body"):
             with Container(classes="pane pane-table"):
                 yield Static("Results", classes="pane-title")
@@ -517,10 +551,14 @@ class ModuleView(ScrollableContainer):
     def action_refresh(self) -> None:
         self.loaded = True
         self.detail_cache.clear()
+        self._refresh_header()
         self.query_one(f"#detail-label-{self.module.id}", Static).update("Preview")
         self._set_detail_text("Loading data...")
         self.app.update_status(f"Loading {self.module.title.lower()}...")
         self._load_records()
+
+    def _refresh_header(self) -> None:
+        self.query_one(f"#description-{self.module.id}", Static).update(self.module.subtitle())
 
     def show_preview(self, key: str) -> None:
         if key not in self.records:
@@ -765,7 +803,7 @@ class WorkspaceApp(App):
         align: right middle;
     }
 
-    #compose-modal Input, #event-modal Input, #doc-create-modal Input {
+    #compose-modal Input, #event-modal Input, #doc-create-modal Input, #gmail-search-modal Input {
         margin-bottom: 1;
     }
 
@@ -807,6 +845,8 @@ class WorkspaceApp(App):
         ("e", "reply_email", "Reply"),
         ("l", "edit_labels", "Labels"),
         ("n", "create_doc", "New Doc"),
+        ("/", "search_email", "Search"),
+        ("u", "toggle_unread_filter", "Unread"),
         ("[", "previous_calendar_month", "Prev Month"),
         ("]", "next_calendar_month", "Next Month"),
         ("tab", "next_module", "Next"),
@@ -836,7 +876,7 @@ class WorkspaceApp(App):
                         id="module-list",
                     )
                     yield Static(
-                        "1-9 switch modules\nTab / Shift+Tab switch modules\nArrow keys move rows\nEnter loads full detail\na add calendar event\n[ / ] change month\nc compose email\nd move to trash\ne reply email\nl edit gmail labels\nn new doc\nw edit doc\nr refresh",
+                        "1-9 switch modules\nTab / Shift+Tab switch modules\nArrow keys move rows\nEnter loads full detail\n/ search gmail\nu toggle unread filter\na add calendar event\n[ / ] change month\nc compose email\nd move to trash\ne reply email\nl edit gmail labels\nn new doc\nw edit doc\nr refresh",
                         id="sidebar-help",
                     )
                 with ContentSwitcher(initial=f"frame-{self.current_module_id}", id="content-switcher"):
@@ -891,6 +931,22 @@ class WorkspaceApp(App):
             self.update_status("Compose is only available in Gmail")
             return
         self.push_screen(ComposeEmailScreen(), self._handle_compose_result)
+
+    def action_search_email(self) -> None:
+        gmail_module = self._current_gmail_module()
+        if gmail_module is None:
+            self.update_status("Search is only available in Gmail")
+            return
+        self.push_screen(GmailSearchScreen(gmail_module.search_query), self._handle_search_result)
+
+    def action_toggle_unread_filter(self) -> None:
+        gmail_module = self._current_gmail_module()
+        if gmail_module is None:
+            self.update_status("Unread filter is only available in Gmail")
+            return
+        state = gmail_module.toggle_unread_only()
+        self.update_status(f"Gmail unread filter {'enabled' if state else 'disabled'}")
+        self.module_views["gmail"].action_refresh()
 
     def action_create_doc(self) -> None:
         docs_module = self._current_docs_module()
@@ -1047,6 +1103,18 @@ class WorkspaceApp(App):
             result["body"],
             self._parse_attachment_paths(result.get("attachments", "")),
         )
+
+    def _handle_search_result(self, result: str | None) -> None:
+        if result is None:
+            self.update_status("Search cancelled")
+            return
+        gmail_module = self._current_gmail_module()
+        if gmail_module is None:
+            self.update_status("Search is only available in Gmail")
+            return
+        gmail_module.set_search_query(result)
+        self.update_status(f"Gmail scope: {gmail_module.scope_summary()}")
+        self.module_views["gmail"].action_refresh()
 
     def _handle_create_doc_result(self, result: dict[str, str] | None) -> None:
         if result is None:

@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from datetime import timezone
 
+from gws_tui.models import Record
 from gws_tui.modules.calendar import CalendarModule, event_day_keys, format_event_time
 from gws_tui.modules.docs import DocsModule, document_body_end_index, extract_document_text
 from gws_tui.modules.gmail import GmailModule, extract_body, format_message_date, normalize_reply_subject
@@ -244,6 +245,84 @@ class GmailHelpersTest(unittest.TestCase):
         self.assertEqual(client.calls[-1][3]["threadId"], "thread-1")
         self.assertIn("raw", client.calls[-1][3])
 
+    def test_fetch_records_uses_search_query_and_unread_filter(self) -> None:
+        client = StubClient()
+        module = GmailModule()
+        module.set_search_query("from:boss@example.com")
+        module.toggle_unread_only()
+        client.add(
+            ("gmail", "users", "messages", "list", "[('maxResults', 20), ('q', 'from:boss@example.com is:unread'), ('userId', 'me')]"),
+            {"messages": []},
+        )
+
+        records = module.fetch_records(client)  # type: ignore[arg-type]
+
+        self.assertEqual(records, [])
+        self.assertEqual(client.calls[-1][1], ("users", "messages", "list"))
+        self.assertEqual(client.calls[-1][2]["q"], "from:boss@example.com is:unread")
+        self.assertEqual(module.subtitle(), 'Mailbox: query="from:boss@example.com", unread only')
+
+    def test_fetch_detail_reads_thread_messages(self) -> None:
+        client = StubClient()
+        module = GmailModule()
+        client.add(
+            ("gmail", "users", "threads", "get", "[('format', 'full'), ('id', 'thread-1'), ('userId', 'me')]"),
+            {
+                "messages": [
+                    {
+                        "id": "msg-1",
+                        "payload": {
+                            "headers": [
+                                {"name": "Subject", "value": "Project update"},
+                                {"name": "From", "value": "A <a@example.com>"},
+                                {"name": "To", "value": "me@example.com"},
+                                {"name": "Date", "value": "Fri, 06 Mar 2026 10:00:00 +0000"},
+                            ],
+                            "body": {"data": "SGVsbG8"},
+                        },
+                        "snippet": "Hello",
+                        "labelIds": ["INBOX"],
+                    },
+                    {
+                        "id": "msg-2",
+                        "payload": {
+                            "headers": [
+                                {"name": "Subject", "value": "Project update"},
+                                {"name": "From", "value": "me@example.com"},
+                                {"name": "To", "value": "A <a@example.com>"},
+                                {"name": "Date", "value": "Fri, 06 Mar 2026 11:00:00 +0000"},
+                            ],
+                            "parts": [
+                                {"mimeType": "text/plain", "body": {"data": "V29ybGQ"}},
+                                {"filename": "notes.txt", "mimeType": "text/plain", "body": {}},
+                            ],
+                        },
+                        "snippet": "World",
+                        "labelIds": ["SENT"],
+                    },
+                ]
+            },
+        )
+
+        record = Record(
+            key="msg-2",
+            columns=("A", "Project update", "Mar 06 11:00 AM"),
+            title="Project update",
+            subtitle="A",
+            raw={"thread_id": "thread-1"},
+        )
+
+        detail = module.fetch_detail(client, record)
+
+        self.assertEqual(client.calls[-1][1], ("users", "threads", "get"))
+        self.assertIn("Thread: Project update", detail)
+        self.assertIn("Messages: 2", detail)
+        self.assertIn("--- Message 2 [selected] ---", detail)
+        self.assertIn("Hello", detail)
+        self.assertIn("World", detail)
+        self.assertIn("Attachments: notes.txt", detail)
+        self.assertEqual(record.raw["label_ids"], ["SENT"])
+
     def test_trash_message_uses_trash_endpoint(self) -> None:
         client = StubClient()
         module = GmailModule()
@@ -368,7 +447,7 @@ class DocsModuleTest(unittest.TestCase):
             },
         )
 
-        record = __import__("gws_tui.models", fromlist=["Record"]).Record(
+        record = Record(
             key="doc-1",
             columns=("Spec", "Aimee", "Mar 06 10:00 AM"),
             title="Spec",

@@ -15,6 +15,9 @@ class WorkspaceModule(ABC):
     columns: tuple[str, ...]
     empty_message: str = "No records found."
 
+    def subtitle(self) -> str:
+        return self.description
+
     @abstractmethod
     def fetch_records(self, client: GwsClient) -> list[Record]:
         raise NotImplementedError

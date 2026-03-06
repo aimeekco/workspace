@@ -71,12 +71,58 @@ def quote_text(value: str) -> str:
     return "\n".join("> " if line == "" else f"> {line}" for line in lines)
 
 
+def attachment_names(payload: dict) -> list[str]:
+    names: list[str] = []
+    for part in payload.get("parts") or []:
+        filename = part.get("filename", "").strip()
+        if filename:
+            names.append(filename)
+        names.extend(attachment_names(part))
+    return names
+
+
 class GmailModule(WorkspaceModule):
     id = "gmail"
     title = "Gmail"
     description = "Recent inbox messages."
     columns = ("From", "Subject", "Date")
     empty_message = "No inbox messages found."
+
+    def __init__(self) -> None:
+        self.search_query = ""
+        self.unread_only = False
+
+    def subtitle(self) -> str:
+        if not self.search_query and not self.unread_only:
+            return self.description
+        return f"Mailbox: {self.scope_summary()}"
+
+    def scope_query(self) -> str:
+        terms: list[str] = []
+        if self.search_query:
+            terms.append(self.search_query)
+        else:
+            terms.append("in:inbox")
+        if self.unread_only:
+            terms.append("is:unread")
+        return " ".join(term for term in terms if term)
+
+    def scope_summary(self) -> str:
+        parts: list[str] = []
+        if self.search_query:
+            parts.append(f'query="{self.search_query}"')
+        else:
+            parts.append("inbox")
+        if self.unread_only:
+            parts.append("unread only")
+        return ", ".join(parts)
+
+    def set_search_query(self, query: str) -> None:
+        self.search_query = query.strip()
+
+    def toggle_unread_only(self) -> bool:
+        self.unread_only = not self.unread_only
+        return self.unread_only
 
     def build_raw_message(
         self,
@@ -132,6 +178,8 @@ class GmailModule(WorkspaceModule):
             )
 
     def fetch_records(self, client: GwsClient) -> list[Record]:
+        query = self.scope_query()
+        self.empty_message = f"No Gmail messages found for {self.scope_summary()}."
         response = client.run(
             "gmail",
             "users",
@@ -140,7 +188,7 @@ class GmailModule(WorkspaceModule):
             params={
                 "userId": "me",
                 "maxResults": 20,
-                "q": "in:inbox",
+                "q": query,
             },
         )
         message_ids = [message["id"] for message in response.get("messages", [])]
@@ -325,6 +373,10 @@ class GmailModule(WorkspaceModule):
         )
 
     def fetch_detail(self, client: GwsClient, record: Record) -> str:
+        thread_id = str(record.raw.get("thread_id") or "").strip()
+        if thread_id:
+            return self.fetch_thread_detail(client, record, thread_id)
+
         response = client.run(
             "gmail",
             "users",
@@ -345,12 +397,68 @@ class GmailModule(WorkspaceModule):
         body = extract_body(payload).strip() or response.get("snippet") or "(No message body)"
         label_ids = response.get("labelIds", [])
         record.raw["label_ids"] = label_ids
+        attachments = attachment_names(payload)
         lines = [
             f"Subject: {subject}",
             f"From: {sender}",
             f"To: {recipient}",
             f"Date: {date}",
-            "",
-            body,
         ]
+        if attachments:
+            lines.append(f"Attachments: {', '.join(attachments)}")
+        lines.extend(["", body])
+        return "\n".join(lines)
+
+    def fetch_thread_detail(self, client: GwsClient, record: Record, thread_id: str) -> str:
+        response = client.run(
+            "gmail",
+            "users",
+            "threads",
+            "get",
+            params={
+                "userId": "me",
+                "id": thread_id,
+                "format": "full",
+            },
+        )
+        messages = response.get("messages", [])
+        if not messages:
+            return "(Empty thread)"
+
+        selected_message = next((message for message in messages if message.get("id") == record.key), messages[-1])
+        record.raw["label_ids"] = selected_message.get("labelIds", [])
+
+        thread_subject = header_value(
+            selected_message.get("payload", {}).get("headers", []),
+            "Subject",
+            record.title or "No subject",
+        )
+        lines = [
+            f"Thread: {thread_subject}",
+            f"Messages: {len(messages)}",
+            "",
+        ]
+
+        for index, message in enumerate(messages, start=1):
+            payload = message.get("payload", {})
+            headers = payload.get("headers", [])
+            sender = header_value(headers, "From", "Unknown sender")
+            recipient = header_value(headers, "To", "Unknown recipient")
+            date = header_value(headers, "Date", "Unknown date")
+            subject = header_value(headers, "Subject", thread_subject)
+            body = extract_body(payload).strip() or message.get("snippet") or "(No message body)"
+            attachments = attachment_names(payload)
+            marker = " [selected]" if message.get("id") == record.key else ""
+            lines.extend(
+                [
+                    f"--- Message {index}{marker} ---",
+                    f"Subject: {subject}",
+                    f"From: {sender}",
+                    f"To: {recipient}",
+                    f"Date: {date}",
+                ]
+            )
+            if attachments:
+                lines.append(f"Attachments: {', '.join(attachments)}")
+            lines.extend(["", body, ""])
         return "\n".join(lines)
