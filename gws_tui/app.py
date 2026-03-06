@@ -15,6 +15,7 @@ from gws_tui.client import GwsClient, GwsError
 from gws_tui.models import Record
 from gws_tui.modules import WorkspaceModule, built_in_modules
 from gws_tui.modules.calendar import CalendarModule
+from gws_tui.modules.docs import DocsModule
 from gws_tui.modules.gmail import GmailModule
 
 
@@ -209,6 +210,77 @@ class LabelEditorScreen(ModalScreen[list[str] | None]):
             return
         selected_ids = [checkbox.name for checkbox in self.query(Checkbox) if checkbox.value and checkbox.name]
         self.dismiss(selected_ids)
+
+
+class CreateDocumentScreen(ModalScreen[dict[str, str] | None]):
+    """Create a Google Doc."""
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        with Container(id="doc-create-modal", classes="modal-window"):
+            yield Static("Create Google Doc", classes="modal-title")
+            yield Static("Create a new document with plain-text body content.", classes="modal-subtitle")
+            yield Input(placeholder="Document title", id="doc-create-title")
+            yield TextArea("", id="doc-create-body")
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel", id="doc-create-cancel")
+                yield Button("Create", variant="primary", id="doc-create-submit")
+
+    def on_mount(self) -> None:
+        self.query_one("#doc-create-title", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "doc-create-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id != "doc-create-submit":
+            return
+        title = self.query_one("#doc-create-title", Input).value.strip()
+        body = self.query_one("#doc-create-body", TextArea).text
+        if not title:
+            self.app.update_status("Docs: title is required")
+            self.query_one("#doc-create-title", Input).focus()
+            return
+        self.dismiss({"title": title, "body": body})
+
+
+class EditDocumentScreen(ModalScreen[dict[str, str] | None]):
+    """Edit Google Doc body content."""
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, title: str, body: str) -> None:
+        super().__init__()
+        self.title = title
+        self.body = body
+
+    def compose(self) -> ComposeResult:
+        with Container(id="doc-edit-modal", classes="modal-window"):
+            yield Static("Edit Google Doc", classes="modal-title")
+            yield Static(self.title, classes="modal-subtitle")
+            yield TextArea(self.body, id="doc-edit-body")
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel", id="doc-edit-cancel")
+                yield Button("Save", variant="primary", id="doc-edit-submit")
+
+    def on_mount(self) -> None:
+        self.query_one("#doc-edit-body", TextArea).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "doc-edit-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id != "doc-edit-submit":
+            return
+        body = self.query_one("#doc-edit-body", TextArea).text
+        self.dismiss({"body": body})
 
 
 class CalendarGridView(ScrollableContainer):
@@ -643,7 +715,7 @@ class WorkspaceApp(App):
         height: 1fr;
     }
 
-    ComposeEmailScreen, CreateEventScreen, ConfirmDeleteScreen, LabelEditorScreen {
+    ComposeEmailScreen, CreateEventScreen, ConfirmDeleteScreen, LabelEditorScreen, CreateDocumentScreen, EditDocumentScreen {
         align: center middle;
     }
 
@@ -677,11 +749,11 @@ class WorkspaceApp(App):
         align: right middle;
     }
 
-    #compose-modal Input, #event-modal Input {
+    #compose-modal Input, #event-modal Input, #doc-create-modal Input {
         margin-bottom: 1;
     }
 
-    #compose-body, #event-description {
+    #compose-body, #event-description, #doc-create-body, #doc-edit-body {
         height: 12;
         margin-bottom: 1;
     }
@@ -718,10 +790,12 @@ class WorkspaceApp(App):
         ("d", "delete_email", "Trash"),
         ("e", "reply_email", "Reply"),
         ("l", "edit_labels", "Labels"),
+        ("n", "create_doc", "New Doc"),
         ("[", "previous_calendar_month", "Prev Month"),
         ("]", "next_calendar_month", "Next Month"),
         ("tab", "next_module", "Next"),
         ("shift+tab", "previous_module", "Prev"),
+        ("w", "edit_doc", "Edit Doc"),
     ]
 
     def __init__(self, client: GwsClient | None = None) -> None:
@@ -743,7 +817,7 @@ class WorkspaceApp(App):
                         id="module-list",
                     )
                     yield Static(
-                        "Tab / Shift+Tab switch modules\nArrow keys move rows\nEnter loads full detail\na add calendar event\n[ / ] change month\nc compose email\nd move to trash\ne reply email\nl edit gmail labels\nr refresh",
+                        "Tab / Shift+Tab switch modules\nArrow keys move rows\nEnter loads full detail\na add calendar event\n[ / ] change month\nc compose email\nd move to trash\ne reply email\nl edit gmail labels\nn new doc\nw edit doc\nr refresh",
                         id="sidebar-help",
                     )
                 with ContentSwitcher(initial=f"frame-{self.current_module_id}", id="content-switcher"):
@@ -784,6 +858,13 @@ class WorkspaceApp(App):
             return
         self.push_screen(ComposeEmailScreen(), self._handle_compose_result)
 
+    def action_create_doc(self) -> None:
+        docs_module = self._current_docs_module()
+        if docs_module is None:
+            self.update_status("New doc is only available in Docs")
+            return
+        self.push_screen(CreateDocumentScreen(), self._handle_create_doc_result)
+
     def action_reply_email(self) -> None:
         gmail_module = self._current_gmail_module()
         if gmail_module is None:
@@ -795,6 +876,18 @@ class WorkspaceApp(App):
             return
         self.update_status("Loading reply context...")
         self._load_reply_context(gmail_module, record.key)
+
+    def action_edit_doc(self) -> None:
+        docs_module = self._current_docs_module()
+        if docs_module is None:
+            self.update_status("Edit doc is only available in Docs")
+            return
+        record = self.module_views[self.current_module_id].current_record()
+        if record is None:
+            self.update_status("Edit doc: no document selected")
+            return
+        self.update_status("Loading document editor...")
+        self._load_doc_editor(docs_module, record)
 
     def action_delete_email(self) -> None:
         gmail_module = self._current_gmail_module()
@@ -879,6 +972,12 @@ class WorkspaceApp(App):
                 return module
         return None
 
+    def _current_docs_module(self) -> DocsModule | None:
+        for module in self.modules:
+            if module.id == self.current_module_id and isinstance(module, DocsModule):
+                return module
+        return None
+
     def _handle_event_result(self, result: dict[str, str] | None) -> None:
         if result is None:
             self.update_status("Event creation cancelled")
@@ -908,6 +1007,28 @@ class WorkspaceApp(App):
             return
         self.update_status("Sending email...")
         self._send_email(gmail_module, result["to"], result["subject"], result["body"])
+
+    def _handle_create_doc_result(self, result: dict[str, str] | None) -> None:
+        if result is None:
+            self.update_status("Document creation cancelled")
+            return
+        docs_module = self._current_docs_module()
+        if docs_module is None:
+            self.update_status("New doc is only available in Docs")
+            return
+        self.update_status("Creating document...")
+        self._create_doc(docs_module, result["title"], result["body"])
+
+    def _handle_edit_doc_result(self, result: dict[str, str] | None, record: Record) -> None:
+        if result is None:
+            self.update_status("Document edit cancelled")
+            return
+        docs_module = self._current_docs_module()
+        if docs_module is None:
+            self.update_status("Edit doc is only available in Docs")
+            return
+        self.update_status("Saving document...")
+        self._save_doc(docs_module, record.key, result["body"])
 
     def _handle_reply_result(self, result: dict[str, str] | None, reply_context: dict[str, str]) -> None:
         if result is None:
@@ -990,6 +1111,50 @@ class WorkspaceApp(App):
             return
         self.call_from_thread(self.update_status, "Calendar event created")
         self.call_from_thread(self.module_views["calendar"].action_refresh)
+
+    @work(thread=True, exclusive=True)
+    def _create_doc(self, docs_module: DocsModule, title: str, body: str) -> None:
+        try:
+            docs_module.create_document(self.client, title=title, body=body)
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Doc create failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Doc create failed: {exc}")
+            return
+        self.call_from_thread(self.update_status, "Document created")
+        self.call_from_thread(self.module_views["docs"].action_refresh)
+
+    @work(thread=True, exclusive=True)
+    def _load_doc_editor(self, docs_module: DocsModule, record: Record) -> None:
+        try:
+            context = docs_module.fetch_editor_context(self.client, record)
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Doc editor failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Doc editor failed: {exc}")
+            return
+        self.call_from_thread(self._show_doc_editor, record, context)
+
+    def _show_doc_editor(self, record: Record, context: dict[str, str]) -> None:
+        self.push_screen(
+            EditDocumentScreen(context["title"], context["body"]),
+            lambda result: self._handle_edit_doc_result(result, record),
+        )
+
+    @work(thread=True, exclusive=True)
+    def _save_doc(self, docs_module: DocsModule, document_id: str, body: str) -> None:
+        try:
+            docs_module.update_document_text(self.client, document_id=document_id, body=body)
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Doc save failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Doc save failed: {exc}")
+            return
+        self.call_from_thread(self.update_status, "Document saved")
+        self.call_from_thread(self.module_views["docs"].action_refresh)
 
     @work(thread=True, exclusive=True)
     def _send_email(self, gmail_module: GmailModule, to: str, subject: str, body: str) -> None:

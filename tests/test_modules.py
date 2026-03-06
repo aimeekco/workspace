@@ -4,7 +4,7 @@ import unittest
 from datetime import timezone
 
 from gws_tui.modules.calendar import CalendarModule, event_day_keys, format_event_time
-from gws_tui.modules.docs import DocsModule, extract_document_text
+from gws_tui.modules.docs import DocsModule, document_body_end_index, extract_document_text
 from gws_tui.modules.gmail import GmailModule, extract_body, format_message_date, normalize_reply_subject
 
 
@@ -359,6 +359,49 @@ class DocsModuleTest(unittest.TestCase):
 
         self.assertIn("Title: Spec", detail)
         self.assertIn("Hello docs", detail)
+
+    def test_document_body_end_index_uses_last_block(self) -> None:
+        end_index = document_body_end_index(
+            {
+                "body": {
+                    "content": [
+                        {"endIndex": 1},
+                        {"endIndex": 42},
+                    ]
+                }
+            }
+        )
+
+        self.assertEqual(end_index, 42)
+
+    def test_create_document_creates_then_inserts_text(self) -> None:
+        client = StubClient()
+        module = DocsModule()
+        client.add(("docs", "documents", "create", "[]"), {"documentId": "doc-1", "title": "Spec"})
+        client.add(("docs", "documents", "batchUpdate", "[('documentId', 'doc-1')]"), {"documentId": "doc-1"})
+
+        response = module.create_document(client, title="Spec", body="Hello docs")  # type: ignore[arg-type]
+
+        self.assertEqual(response["documentId"], "doc-1")
+        self.assertEqual(client.calls[0][1], ("documents", "create"))
+        self.assertEqual(client.calls[1][1], ("documents", "batchUpdate"))
+        self.assertEqual(client.calls[1][3]["requests"][0]["insertText"]["text"], "Hello docs")
+
+    def test_update_document_text_replaces_existing_content(self) -> None:
+        client = StubClient()
+        module = DocsModule()
+        client.add(
+            ("docs", "documents", "get", "[('documentId', 'doc-1'), ('includeTabsContent', False)]"),
+            {"body": {"content": [{"endIndex": 15}]}},
+        )
+        client.add(("docs", "documents", "batchUpdate", "[('documentId', 'doc-1')]"), {"documentId": "doc-1"})
+
+        response = module.update_document_text(client, "doc-1", "Updated text")  # type: ignore[arg-type]
+
+        self.assertEqual(response["documentId"], "doc-1")
+        requests = client.calls[-1][3]["requests"]
+        self.assertEqual(requests[0]["deleteContentRange"]["range"], {"startIndex": 1, "endIndex": 14})
+        self.assertEqual(requests[1]["insertText"]["text"], "Updated text")
 
 
 if __name__ == "__main__":

@@ -48,6 +48,11 @@ def extract_document_text(document: dict[str, Any]) -> str:
     return "\n\n".join(lines).strip()
 
 
+def document_body_end_index(document: dict[str, Any]) -> int:
+    content = document.get("body", {}).get("content", [])
+    return max((block.get("endIndex", 1) for block in content), default=1)
+
+
 class DocsModule(WorkspaceModule):
     id = "docs"
     title = "Docs"
@@ -116,6 +121,89 @@ class DocsModule(WorkspaceModule):
             text or "(No document text found)",
         ]
         return "\n".join(lines)
+
+    def fetch_editor_context(self, client: GwsClient, record: Record) -> dict[str, str]:
+        document = client.run(
+            "docs",
+            "documents",
+            "get",
+            params={
+                "documentId": record.key,
+                "includeTabsContent": False,
+            },
+        )
+        return {
+            "document_id": record.key,
+            "title": document.get("title", record.title),
+            "body": extract_document_text(document),
+        }
+
+    def create_document(self, client: GwsClient, title: str, body: str) -> dict:
+        document = client.run(
+            "docs",
+            "documents",
+            "create",
+            body={"title": title},
+        )
+        document_id = document["documentId"]
+        if body.strip():
+            client.run(
+                "docs",
+                "documents",
+                "batchUpdate",
+                params={"documentId": document_id},
+                body={
+                    "requests": [
+                        {
+                            "insertText": {
+                                "location": {"index": 1},
+                                "text": body,
+                            }
+                        }
+                    ]
+                },
+            )
+        return document
+
+    def update_document_text(self, client: GwsClient, document_id: str, body: str) -> dict:
+        document = client.run(
+            "docs",
+            "documents",
+            "get",
+            params={
+                "documentId": document_id,
+                "includeTabsContent": False,
+            },
+        )
+        end_index = document_body_end_index(document)
+        requests: list[dict[str, Any]] = []
+        if end_index > 1:
+            requests.append(
+                {
+                    "deleteContentRange": {
+                        "range": {
+                            "startIndex": 1,
+                            "endIndex": end_index - 1,
+                        }
+                    }
+                }
+            )
+        if body:
+            requests.append(
+                {
+                    "insertText": {
+                        "location": {"index": 1},
+                        "text": body,
+                    }
+                }
+            )
+        return client.run(
+            "docs",
+            "documents",
+            "batchUpdate",
+            params={"documentId": document_id},
+            body={"requests": requests},
+        )
 
     def _collect_items(self, response: dict[str, Any] | list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
         if isinstance(response, list):
