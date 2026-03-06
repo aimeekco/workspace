@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gws-workspace-tui"
+version = "0.1.0"
+description = "A Textual TUI for Google Workspace services via gws"
+requires-python = ">=3.11"
+dependencies = [
+    "textual>=0.80",
+    "rich>=13.0",
+]
+
+[project.scripts]
+gws-workspace-tui = "gws_tui.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["gws_tui*"]
