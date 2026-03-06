@@ -3,17 +3,19 @@ from __future__ import annotations
 import unittest
 
 from gws_tui.modules.calendar import CalendarModule, format_event_time
-from gws_tui.modules.gmail import extract_body, format_message_date
+from gws_tui.modules.gmail import GmailModule, extract_body, format_message_date
 
 
 class StubClient:
     def __init__(self) -> None:
         self.responses: dict[tuple[str, ...], object] = {}
+        self.calls: list[tuple[str, tuple[str, ...], dict | None, dict | None]] = []
 
     def add(self, key: tuple[str, ...], response: object) -> None:
         self.responses[key] = response
 
     def run(self, service: str, *segments: str, params=None, body=None, page_all=False, page_limit=5):  # noqa: ANN001
+        self.calls.append((service, segments, params, body))
         normalized = dict(params or {})
         if service == "calendar" and segments == ("events", "list"):
             if "timeMin" in normalized:
@@ -89,6 +91,46 @@ class CalendarModuleTest(unittest.TestCase):
     def test_format_event_time_handles_all_day_events(self) -> None:
         self.assertEqual(format_event_time({"start": {"date": "2026-03-09"}}), "2026-03-09 all day")
 
+    def test_build_event_body_contains_timed_range(self) -> None:
+        module = CalendarModule()
+
+        body = module.build_event_body(
+            summary="Planning",
+            start_text="2026-03-09 09:00",
+            end_text="2026-03-09 10:00",
+            location="Room 1",
+            description="Agenda",
+        )
+
+        self.assertEqual(body["summary"], "Planning")
+        self.assertEqual(body["location"], "Room 1")
+        self.assertEqual(body["description"], "Agenda")
+        self.assertIn("T09:00:00", body["start"]["dateTime"])
+        self.assertIn("T10:00:00", body["end"]["dateTime"])
+
+    def test_add_event_uses_insert_endpoint(self) -> None:
+        client = StubClient()
+        module = CalendarModule()
+        client.add(
+            ("calendar", "events", "insert", "[('calendarId', 'primary'), ('sendUpdates', 'none')]"),
+            {"id": "evt-1"},
+        )
+
+        response = module.add_event(
+            client,  # type: ignore[arg-type]
+            calendar_id="primary",
+            summary="Planning",
+            start_text="2026-03-09 09:00",
+            end_text="2026-03-09 10:00",
+            location="Room 1",
+            description="Agenda",
+        )
+
+        self.assertEqual(response["id"], "evt-1")
+        self.assertEqual(client.calls[-1][1], ("events", "insert"))
+        self.assertEqual(client.calls[-1][2], {"calendarId": "primary", "sendUpdates": "none"})
+        self.assertEqual(client.calls[-1][3]["summary"], "Planning")
+
 
 class GmailHelpersTest(unittest.TestCase):
     def test_extract_body_prefers_plain_text(self) -> None:
@@ -103,6 +145,37 @@ class GmailHelpersTest(unittest.TestCase):
 
     def test_format_message_date_falls_back(self) -> None:
         self.assertEqual(format_message_date(""), "Unknown date")
+
+    def test_build_raw_message_contains_headers_and_body(self) -> None:
+        module = GmailModule()
+
+        raw = module.build_raw_message("to@example.com", "Hello", "Body text")
+        raw_bytes = __import__("base64").urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+        text = raw_bytes.decode("utf-8")
+        self.assertIn("To: to@example.com", text)
+        self.assertIn("Subject: Hello", text)
+        self.assertIn("Body text", text)
+
+    def test_send_message_uses_send_endpoint(self) -> None:
+        client = StubClient()
+        module = GmailModule()
+        client.add(("gmail", "users", "messages", "send", "[('userId', 'me')]"), {"id": "sent-1"})
+
+        response = module.send_message(client, "to@example.com", "Hello", "Body text")  # type: ignore[arg-type]
+
+        self.assertEqual(response["id"], "sent-1")
+        self.assertEqual(client.calls[-1][0], "gmail")
+        self.assertEqual(client.calls[-1][1], ("users", "messages", "send"))
+        self.assertIn("raw", client.calls[-1][3])
+
+    def test_trash_message_uses_trash_endpoint(self) -> None:
+        client = StubClient()
+        module = GmailModule()
+        client.add(("gmail", "users", "messages", "trash", "[('id', 'msg-1'), ('userId', 'me')]"), {})
+
+        module.trash_message(client, "msg-1")  # type: ignore[arg-type]
+
+        self.assertEqual(client.calls[-1][1], ("users", "messages", "trash"))
 
 
 if __name__ == "__main__":

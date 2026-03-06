@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from concurrent.futures import ThreadPoolExecutor
+from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
 
 from gws_tui.client import GwsClient
@@ -63,6 +64,14 @@ class GmailModule(WorkspaceModule):
     columns = ("From", "Subject", "Date")
     empty_message = "No inbox messages found."
 
+    def build_raw_message(self, to: str, subject: str, body: str) -> str:
+        message = EmailMessage()
+        message["To"] = to
+        message["Subject"] = subject
+        message.set_content(body)
+        encoded = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+        return encoded.rstrip("=")
+
     def fetch_records(self, client: GwsClient) -> list[Record]:
         response = client.run(
             "gmail",
@@ -120,6 +129,25 @@ class GmailModule(WorkspaceModule):
                 "id": message_id,
                 "format": "metadata",
             },
+        )
+
+    def send_message(self, client: GwsClient, to: str, subject: str, body: str) -> dict:
+        return client.run(
+            "gmail",
+            "users",
+            "messages",
+            "send",
+            params={"userId": "me"},
+            body={"raw": self.build_raw_message(to=to, subject=subject, body=body)},
+        )
+
+    def trash_message(self, client: GwsClient, message_id: str) -> dict:
+        return client.run(
+            "gmail",
+            "users",
+            "messages",
+            "trash",
+            params={"userId": "me", "id": message_id},
         )
 
     def fetch_detail(self, client: GwsClient, record: Record) -> str:

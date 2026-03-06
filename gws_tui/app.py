@@ -5,11 +5,149 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, ScrollableContainer
-from textual.widgets import ContentSwitcher, DataTable, Footer, Header, ListItem, ListView, Static
+from textual.screen import ModalScreen
+from textual.widgets import Button, ContentSwitcher, DataTable, Footer, Header, Input, ListItem, ListView, Static, TextArea
 
 from gws_tui.client import GwsClient, GwsError
 from gws_tui.models import Record
 from gws_tui.modules import WorkspaceModule, built_in_modules
+from gws_tui.modules.calendar import CalendarModule
+from gws_tui.modules.gmail import GmailModule
+
+
+class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
+    """Compose a plain text email."""
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        with Container(id="compose-modal", classes="modal-window"):
+            yield Static("Compose Email", classes="modal-title")
+            yield Static("Send a plain text Gmail message.", classes="modal-subtitle")
+            yield Input(placeholder="recipient@example.com", id="compose-to")
+            yield Input(placeholder="Subject", id="compose-subject")
+            yield TextArea("", id="compose-body")
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel", id="compose-cancel")
+                yield Button("Send", variant="primary", id="compose-send")
+
+    def on_mount(self) -> None:
+        self.query_one("#compose-to", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "compose-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id != "compose-send":
+            return
+        to = self.query_one("#compose-to", Input).value.strip()
+        subject = self.query_one("#compose-subject", Input).value.strip()
+        body = self.query_one("#compose-body", TextArea).text.strip()
+        if not to:
+            self.app.update_status("Compose: recipient is required")
+            self.query_one("#compose-to", Input).focus()
+            return
+        if not subject:
+            self.app.update_status("Compose: subject is required")
+            self.query_one("#compose-subject", Input).focus()
+            return
+        if not body:
+            self.app.update_status("Compose: body is required")
+            self.query_one("#compose-body", TextArea).focus()
+            return
+        self.dismiss({"to": to, "subject": subject, "body": body})
+
+
+class CreateEventScreen(ModalScreen[dict[str, str] | None]):
+    """Create a calendar event."""
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, calendar_id: str) -> None:
+        super().__init__()
+        self.calendar_id = calendar_id
+
+    def compose(self) -> ComposeResult:
+        with Container(id="event-modal", classes="modal-window"):
+            yield Static("Create Calendar Event", classes="modal-title")
+            yield Static("Times use local format: YYYY-MM-DD HH:MM", classes="modal-subtitle")
+            yield Input(value=self.calendar_id, placeholder="primary", id="event-calendar")
+            yield Input(placeholder="Title", id="event-summary")
+            with Horizontal(classes="modal-row"):
+                yield Input(placeholder="2026-03-06 09:00", id="event-start")
+                yield Input(placeholder="2026-03-06 10:00", id="event-end")
+            yield Input(placeholder="Location", id="event-location")
+            yield TextArea("", id="event-description")
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel", id="event-cancel")
+                yield Button("Create", variant="primary", id="event-create")
+
+    def on_mount(self) -> None:
+        self.query_one("#event-summary", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "event-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id != "event-create":
+            return
+        values = {
+            "calendar_id": self.query_one("#event-calendar", Input).value.strip() or "primary",
+            "summary": self.query_one("#event-summary", Input).value.strip(),
+            "start": self.query_one("#event-start", Input).value.strip(),
+            "end": self.query_one("#event-end", Input).value.strip(),
+            "location": self.query_one("#event-location", Input).value.strip(),
+            "description": self.query_one("#event-description", TextArea).text.strip(),
+        }
+        if not values["summary"]:
+            self.app.update_status("Event: title is required")
+            self.query_one("#event-summary", Input).focus()
+            return
+        if not values["start"]:
+            self.app.update_status("Event: start time is required")
+            self.query_one("#event-start", Input).focus()
+            return
+        if not values["end"]:
+            self.app.update_status("Event: end time is required")
+            self.query_one("#event-end", Input).focus()
+            return
+        self.dismiss(values)
+
+
+class ConfirmDeleteScreen(ModalScreen[bool]):
+    """Confirm moving a Gmail message to trash."""
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, subject: str) -> None:
+        super().__init__()
+        self.subject = subject
+
+    def compose(self) -> ComposeResult:
+        with Container(id="confirm-modal", classes="modal-window"):
+            yield Static("Move Email To Trash", classes="modal-title")
+            yield Static(
+                f"Move this email to trash?\n{self.subject}",
+                id="confirm-message",
+            )
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel", id="confirm-cancel")
+                yield Button("Move To Trash", variant="warning", id="confirm-delete")
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "confirm-delete":
+            self.dismiss(True)
+            return
+        self.dismiss(False)
 
 
 class ModuleView(ScrollableContainer):
@@ -20,6 +158,7 @@ class ModuleView(ScrollableContainer):
         self.module = module
         self.client = client
         self.records: dict[str, Record] = {}
+        self.current_key: str | None = None
         self.detail_cache: dict[str, str] = {}
         self.loaded = False
 
@@ -59,6 +198,7 @@ class ModuleView(ScrollableContainer):
     def show_preview(self, key: str) -> None:
         if key not in self.records:
             return
+        self.current_key = key
         record = self.records[key]
         preview = record.preview or f"{record.title}\n{record.subtitle}".strip()
         self.query_one(f"#detail-label-{self.module.id}", Static).update("Preview")
@@ -68,6 +208,7 @@ class ModuleView(ScrollableContainer):
     def open_record(self, key: str) -> None:
         if key not in self.records:
             return
+        self.current_key = key
         self.query_one(f"#detail-label-{self.module.id}", Static).update("Detail")
         if key in self.detail_cache:
             self._render_detail(self.detail_cache[key])
@@ -144,6 +285,11 @@ class ModuleView(ScrollableContainer):
         if event.data_table.id != f"table-{self.module.id}" or event.row_key is None:
             return
         self.open_record(str(event.row_key.value))
+
+    def current_record(self) -> Record | None:
+        if self.current_key is None:
+            return None
+        return self.records.get(self.current_key)
 
 
 class WorkspaceApp(App):
@@ -254,6 +400,53 @@ class WorkspaceApp(App):
         height: 1fr;
     }
 
+    ComposeEmailScreen, CreateEventScreen, ConfirmDeleteScreen {
+        align: center middle;
+    }
+
+    .modal-window {
+        width: 70;
+        height: auto;
+        max-height: 90%;
+        padding: 1 2;
+        background: #202020;
+        border: round #3a3a3a;
+    }
+
+    .modal-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    .modal-subtitle {
+        color: #a8a8a8;
+        margin-bottom: 1;
+    }
+
+    .modal-row {
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    .modal-actions {
+        height: auto;
+        margin-top: 1;
+        align: right middle;
+    }
+
+    #compose-modal Input, #event-modal Input {
+        margin-bottom: 1;
+    }
+
+    #compose-body, #event-description {
+        height: 12;
+        margin-bottom: 1;
+    }
+
+    #confirm-message {
+        margin-bottom: 1;
+    }
+
     #status {
         dock: bottom;
         height: 1;
@@ -266,6 +459,9 @@ class WorkspaceApp(App):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("r", "refresh", "Refresh"),
+        ("a", "add_event", "Add Event"),
+        ("c", "compose_email", "Compose"),
+        ("d", "delete_email", "Trash"),
         ("tab", "next_module", "Next"),
         ("shift+tab", "previous_module", "Prev"),
     ]
@@ -289,7 +485,7 @@ class WorkspaceApp(App):
                         id="module-list",
                     )
                     yield Static(
-                        "Tab / Shift+Tab switch modules\nArrow keys move rows\nEnter loads full detail\nr refresh",
+                        "Tab / Shift+Tab switch modules\nArrow keys move rows\nEnter loads full detail\na add calendar event\nc compose email\nd move to trash\nr refresh",
                         id="sidebar-help",
                     )
                 with ContentSwitcher(initial=f"frame-{self.current_module_id}", id="content-switcher"):
@@ -311,6 +507,35 @@ class WorkspaceApp(App):
 
     def action_refresh(self) -> None:
         self.module_views[self.current_module_id].action_refresh()
+
+    def action_add_event(self) -> None:
+        calendar_module = self._current_calendar_module()
+        if calendar_module is None:
+            self.update_status("Add event is only available in Calendar")
+            return
+        default_calendar_id = "primary"
+        record = self.module_views[self.current_module_id].current_record()
+        if record is not None and "calendar_id" in record.raw:
+            default_calendar_id = record.raw["calendar_id"]
+        self.push_screen(CreateEventScreen(default_calendar_id), self._handle_event_result)
+
+    def action_compose_email(self) -> None:
+        gmail_module = self._current_gmail_module()
+        if gmail_module is None:
+            self.update_status("Compose is only available in Gmail")
+            return
+        self.push_screen(ComposeEmailScreen(), self._handle_compose_result)
+
+    def action_delete_email(self) -> None:
+        gmail_module = self._current_gmail_module()
+        if gmail_module is None:
+            self.update_status("Trash is only available in Gmail")
+            return
+        record = self.module_views[self.current_module_id].current_record()
+        if record is None:
+            self.update_status("Trash: no email selected")
+            return
+        self.push_screen(ConfirmDeleteScreen(record.title or "(No subject)"), lambda confirmed: self._handle_delete_result(confirmed, record.key))
 
     def action_next_module(self) -> None:
         module_list = self.query_one(ListView)
@@ -344,3 +569,115 @@ class WorkspaceApp(App):
         self.current_module_id = module_id
         self.query_one(ContentSwitcher).current = f"frame-{module_id}"
         self.module_views[module_id].load_if_needed()
+
+    def _current_calendar_module(self) -> CalendarModule | None:
+        for module in self.modules:
+            if module.id == self.current_module_id and isinstance(module, CalendarModule):
+                return module
+        return None
+
+    def _current_gmail_module(self) -> GmailModule | None:
+        for module in self.modules:
+            if module.id == self.current_module_id and isinstance(module, GmailModule):
+                return module
+        return None
+
+    def _handle_event_result(self, result: dict[str, str] | None) -> None:
+        if result is None:
+            self.update_status("Event creation cancelled")
+            return
+        calendar_module = self._current_calendar_module()
+        if calendar_module is None:
+            self.update_status("Add event is only available in Calendar")
+            return
+        self.update_status("Creating calendar event...")
+        self._create_event(
+            calendar_module,
+            result["calendar_id"],
+            result["summary"],
+            result["start"],
+            result["end"],
+            result["location"],
+            result["description"],
+        )
+
+    def _handle_compose_result(self, result: dict[str, str] | None) -> None:
+        if result is None:
+            self.update_status("Compose cancelled")
+            return
+        gmail_module = self._current_gmail_module()
+        if gmail_module is None:
+            self.update_status("Compose is only available in Gmail")
+            return
+        self.update_status("Sending email...")
+        self._send_email(gmail_module, result["to"], result["subject"], result["body"])
+
+    def _handle_delete_result(self, confirmed: bool, message_id: str) -> None:
+        if not confirmed:
+            self.update_status("Delete cancelled")
+            return
+        gmail_module = self._current_gmail_module()
+        if gmail_module is None:
+            self.update_status("Trash is only available in Gmail")
+            return
+        self.update_status("Moving email to trash...")
+        self._delete_email(gmail_module, message_id)
+
+    @work(thread=True, exclusive=True)
+    def _create_event(
+        self,
+        calendar_module: CalendarModule,
+        calendar_id: str,
+        summary: str,
+        start_text: str,
+        end_text: str,
+        location: str,
+        description: str,
+    ) -> None:
+        try:
+            calendar_module.add_event(
+                self.client,
+                calendar_id=calendar_id,
+                summary=summary,
+                start_text=start_text,
+                end_text=end_text,
+                location=location,
+                description=description,
+            )
+        except ValueError as exc:
+            self.call_from_thread(self.update_status, f"Event failed: {exc}")
+            return
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Event failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Event failed: {exc}")
+            return
+        self.call_from_thread(self.update_status, "Calendar event created")
+        self.call_from_thread(self.module_views["calendar"].action_refresh)
+
+    @work(thread=True, exclusive=True)
+    def _send_email(self, gmail_module: GmailModule, to: str, subject: str, body: str) -> None:
+        try:
+            gmail_module.send_message(self.client, to=to, subject=subject, body=body)
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Send failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Send failed: {exc}")
+            return
+        self.call_from_thread(self.update_status, "Email sent")
+        self.call_from_thread(self.module_views["gmail"].action_refresh)
+
+    @work(thread=True, exclusive=True)
+    def _delete_email(self, gmail_module: GmailModule, message_id: str) -> None:
+        try:
+            gmail_module.trash_message(self.client, message_id=message_id)
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Trash failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Trash failed: {exc}")
+            return
+        self.call_from_thread(self.update_status, "Email moved to trash")
+        self.call_from_thread(self.module_views["gmail"].action_refresh)

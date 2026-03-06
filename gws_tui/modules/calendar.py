@@ -24,6 +24,16 @@ def parse_rfc3339(value: str | None) -> datetime | None:
         return None
 
 
+def parse_local_datetime(value: str) -> datetime:
+    normalized = value.strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(normalized, fmt).astimezone()
+        except ValueError:
+            continue
+    raise ValueError("Use YYYY-MM-DD HH:MM")
+
+
 def format_event_time(event: dict) -> str:
     start = event.get("start", {})
     if "dateTime" in start:
@@ -48,6 +58,54 @@ class CalendarModule(WorkspaceModule):
     description = "Upcoming events across your visible calendars."
     columns = ("Start", "Calendar", "Title", "Location")
     empty_message = "No upcoming events found."
+
+    def build_event_body(
+        self,
+        summary: str,
+        start_text: str,
+        end_text: str,
+        location: str = "",
+        description: str = "",
+    ) -> dict:
+        start = parse_local_datetime(start_text)
+        end = parse_local_datetime(end_text)
+        if end <= start:
+            raise ValueError("End must be after start")
+
+        body = {
+            "summary": summary,
+            "start": {"dateTime": start.isoformat()},
+            "end": {"dateTime": end.isoformat()},
+        }
+        if location.strip():
+            body["location"] = location.strip()
+        if description.strip():
+            body["description"] = description.strip()
+        return body
+
+    def add_event(
+        self,
+        client: GwsClient,
+        calendar_id: str,
+        summary: str,
+        start_text: str,
+        end_text: str,
+        location: str = "",
+        description: str = "",
+    ) -> dict:
+        return client.run(
+            "calendar",
+            "events",
+            "insert",
+            params={"calendarId": calendar_id, "sendUpdates": "none"},
+            body=self.build_event_body(
+                summary=summary,
+                start_text=start_text,
+                end_text=end_text,
+                location=location,
+                description=description,
+            ),
+        )
 
     def fetch_records(self, client: GwsClient) -> list[Record]:
         calendars_response = client.run(
