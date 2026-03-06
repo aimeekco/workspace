@@ -9,7 +9,7 @@ from datetime import timezone
 from gws_tui.models import Record
 from gws_tui.modules.calendar import CalendarModule, event_day_keys, format_event_time
 from gws_tui.modules.docs import DocsModule, document_body_end_index, extract_document_text
-from gws_tui.modules.gmail import GmailModule, extract_body, format_message_date, normalize_reply_subject
+from gws_tui.modules.gmail import GmailModule, extract_body, format_message_date, normalize_forward_subject, normalize_reply_subject
 
 
 class StubClient:
@@ -175,6 +175,14 @@ class GmailHelpersTest(unittest.TestCase):
         self.assertIn("Subject: Hello", text)
         self.assertIn("Body text", text)
 
+    def test_build_raw_message_contains_cc(self) -> None:
+        module = GmailModule()
+
+        raw = module.build_raw_message("to@example.com", "Hello", "Body text", cc="team@example.com")
+        raw_bytes = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+        text = raw_bytes.decode("utf-8")
+        self.assertIn("Cc: team@example.com", text)
+
     def test_build_raw_message_includes_attachment(self) -> None:
         module = GmailModule()
         with tempfile.NamedTemporaryFile("w+b", suffix=".txt", delete=False) as handle:
@@ -197,6 +205,10 @@ class GmailHelpersTest(unittest.TestCase):
         self.assertEqual(normalize_reply_subject("Hello"), "Re: Hello")
         self.assertEqual(normalize_reply_subject("Re: Hello"), "Re: Hello")
 
+    def test_normalize_forward_subject_prefixes_once(self) -> None:
+        self.assertEqual(normalize_forward_subject("Hello"), "Fwd: Hello")
+        self.assertEqual(normalize_forward_subject("Fwd: Hello"), "Fwd: Hello")
+
     def test_build_raw_reply_message_contains_thread_headers(self) -> None:
         module = GmailModule()
 
@@ -204,6 +216,7 @@ class GmailHelpersTest(unittest.TestCase):
             to="from@example.com",
             subject="Re: Hello",
             body="Reply body",
+            cc="team@example.com",
             in_reply_to="<message-id@example.com>",
             references="<prev@example.com> <message-id@example.com>",
         )
@@ -211,6 +224,7 @@ class GmailHelpersTest(unittest.TestCase):
         text = raw_bytes.decode("utf-8")
         self.assertIn("In-Reply-To: <message-id@example.com>", text)
         self.assertIn("References: <prev@example.com> <message-id@example.com>", text)
+        self.assertIn("Cc: team@example.com", text)
         self.assertIn("Reply body", text)
 
     def test_send_message_uses_send_endpoint(self) -> None:
@@ -235,6 +249,7 @@ class GmailHelpersTest(unittest.TestCase):
             to="from@example.com",
             subject="Re: Hello",
             body="Reply body",
+            cc="",
             thread_id="thread-1",
             in_reply_to="<message-id@example.com>",
             references="<message-id@example.com>",
@@ -244,6 +259,41 @@ class GmailHelpersTest(unittest.TestCase):
         self.assertEqual(client.calls[-1][1], ("users", "messages", "send"))
         self.assertEqual(client.calls[-1][3]["threadId"], "thread-1")
         self.assertIn("raw", client.calls[-1][3])
+
+    def test_create_draft_uses_drafts_endpoint(self) -> None:
+        client = StubClient()
+        module = GmailModule()
+        client.add(("gmail", "users", "drafts", "create", "[('userId', 'me')]"), {"id": "draft-1"})
+
+        response = module.create_draft(  # type: ignore[arg-type]
+            client,
+            to="to@example.com",
+            cc="cc@example.com",
+            subject="Hello",
+            body="Body text",
+        )
+
+        self.assertEqual(response["id"], "draft-1")
+        self.assertEqual(client.calls[-1][1], ("users", "drafts", "create"))
+        self.assertIn("message", client.calls[-1][3])
+        self.assertIn("raw", client.calls[-1][3]["message"])
+
+    def test_create_draft_sets_thread_id_for_reply_drafts(self) -> None:
+        client = StubClient()
+        module = GmailModule()
+        client.add(("gmail", "users", "drafts", "create", "[('userId', 'me')]"), {"id": "draft-2"})
+
+        module.create_draft(  # type: ignore[arg-type]
+            client,
+            to="to@example.com",
+            subject="Re: Hello",
+            body="Body text",
+            thread_id="thread-1",
+            in_reply_to="<message-id@example.com>",
+            references="<message-id@example.com>",
+        )
+
+        self.assertEqual(client.calls[-1][3]["message"]["threadId"], "thread-1")
 
     def test_fetch_records_uses_search_query_and_unread_filter(self) -> None:
         client = StubClient()
@@ -322,6 +372,65 @@ class GmailHelpersTest(unittest.TestCase):
         self.assertIn("World", detail)
         self.assertIn("Attachments: notes.txt", detail)
         self.assertEqual(record.raw["label_ids"], ["SENT"])
+
+    def test_fetch_reply_all_context_excludes_current_user(self) -> None:
+        client = StubClient()
+        module = GmailModule()
+        client.add(("gmail", "users", "getProfile", "[('userId', 'me')]"), {"emailAddress": "me@example.com"})
+        client.add(
+            ("gmail", "users", "messages", "get", "[('format', 'full'), ('id', 'msg-1'), ('userId', 'me')]"),
+            {
+                "threadId": "thread-1",
+                "payload": {
+                    "headers": [
+                        {"name": "From", "value": "Alice <alice@example.com>"},
+                        {"name": "To", "value": "Me <me@example.com>, Bob <bob@example.com>"},
+                        {"name": "Cc", "value": "Carol <carol@example.com>, Alice <alice@example.com>"},
+                        {"name": "Subject", "value": "Hello"},
+                        {"name": "Date", "value": "Fri, 06 Mar 2026 10:00:00 +0000"},
+                        {"name": "Message-ID", "value": "<message-id@example.com>"},
+                    ],
+                    "body": {"data": "SGVsbG8"},
+                },
+                "snippet": "Hello",
+            },
+        )
+
+        context = module.fetch_reply_all_context(client, "msg-1")  # type: ignore[arg-type]
+
+        self.assertEqual(context["to"], "Alice <alice@example.com>")
+        self.assertEqual(context["cc"], "Bob <bob@example.com>, Carol <carol@example.com>")
+        self.assertEqual(context["thread_id"], "thread-1")
+
+    def test_fetch_forward_context_builds_prefilled_body(self) -> None:
+        client = StubClient()
+        module = GmailModule()
+        client.add(
+            ("gmail", "users", "messages", "get", "[('format', 'full'), ('id', 'msg-1'), ('userId', 'me')]"),
+            {
+                "payload": {
+                    "headers": [
+                        {"name": "From", "value": "Alice <alice@example.com>"},
+                        {"name": "To", "value": "me@example.com"},
+                        {"name": "Cc", "value": "Bob <bob@example.com>"},
+                        {"name": "Subject", "value": "Hello"},
+                        {"name": "Date", "value": "Fri, 06 Mar 2026 10:00:00 +0000"},
+                    ],
+                    "body": {"data": "SGVsbG8"},
+                },
+                "snippet": "Hello",
+            },
+        )
+
+        context = module.fetch_forward_context(client, "msg-1")  # type: ignore[arg-type]
+
+        self.assertEqual(context["to"], "")
+        self.assertEqual(context["cc"], "")
+        self.assertEqual(context["subject"], "Fwd: Hello")
+        self.assertIn("---------- Forwarded message ---------", context["body"])
+        self.assertIn("From: Alice <alice@example.com>", context["body"])
+        self.assertIn("Cc: Bob <bob@example.com>", context["body"])
+        self.assertIn("Hello", context["body"])
 
     def test_trash_message_uses_trash_endpoint(self) -> None:
         client = StubClient()

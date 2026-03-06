@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
-from email.utils import parsedate_to_datetime
+from email.utils import formataddr, getaddresses, parsedate_to_datetime
 import mimetypes
 from pathlib import Path
 from typing import Any
@@ -66,6 +66,12 @@ def normalize_reply_subject(subject: str) -> str:
     return f"Re: {subject}"
 
 
+def normalize_forward_subject(subject: str) -> str:
+    if subject.lower().startswith("fwd:"):
+        return subject
+    return f"Fwd: {subject}"
+
+
 def quote_text(value: str) -> str:
     lines = value.splitlines() or [""]
     return "\n".join("> " if line == "" else f"> {line}" for line in lines)
@@ -79,6 +85,19 @@ def attachment_names(payload: dict) -> list[str]:
             names.append(filename)
         names.extend(attachment_names(part))
     return names
+
+
+def canonical_addresses(values: list[str], exclude: set[str] | None = None) -> list[str]:
+    excluded = {value.lower() for value in (exclude or set())}
+    seen: set[str] = set()
+    results: list[str] = []
+    for name, address in getaddresses(values):
+        lowered = address.strip().lower()
+        if not lowered or lowered in excluded or lowered in seen:
+            continue
+        seen.add(lowered)
+        results.append(formataddr((name, address.strip())) if name else address.strip())
+    return results
 
 
 class GmailModule(WorkspaceModule):
@@ -96,6 +115,15 @@ class GmailModule(WorkspaceModule):
         if not self.search_query and not self.unread_only:
             return self.description
         return f"Mailbox: {self.scope_summary()}"
+
+    def badge(self) -> str:
+        return "Mail"
+
+    def loading_message(self) -> str:
+        return f"Syncing {self.scope_summary()}..."
+
+    def empty_hint(self) -> str:
+        return "Use / to search, u for unread only, or r to refresh."
 
     def scope_query(self) -> str:
         terms: list[str] = []
@@ -129,10 +157,13 @@ class GmailModule(WorkspaceModule):
         to: str,
         subject: str,
         body: str,
+        cc: str = "",
         attachment_paths: list[str] | None = None,
     ) -> str:
         message = EmailMessage()
         message["To"] = to
+        if cc:
+            message["Cc"] = cc
         message["Subject"] = subject
         message.set_content(body)
         self._attach_files(message, attachment_paths or [])
@@ -144,12 +175,15 @@ class GmailModule(WorkspaceModule):
         to: str,
         subject: str,
         body: str,
+        cc: str,
         in_reply_to: str,
         references: str,
         attachment_paths: list[str] | None = None,
     ) -> str:
         message = EmailMessage()
         message["To"] = to
+        if cc:
+            message["Cc"] = cc
         message["Subject"] = subject
         message["In-Reply-To"] = in_reply_to
         message["References"] = references
@@ -248,6 +282,7 @@ class GmailModule(WorkspaceModule):
         to: str,
         subject: str,
         body: str,
+        cc: str = "",
         attachment_paths: list[str] | None = None,
     ) -> dict:
         return client.run(
@@ -261,10 +296,20 @@ class GmailModule(WorkspaceModule):
                     to=to,
                     subject=subject,
                     body=body,
+                    cc=cc,
                     attachment_paths=attachment_paths,
                 )
             },
         )
+
+    def fetch_profile_email(self, client: GwsClient) -> str:
+        response = client.run(
+            "gmail",
+            "users",
+            "getProfile",
+            params={"userId": "me"},
+        )
+        return str(response.get("emailAddress", "")).strip().lower()
 
     def fetch_reply_context(self, client: GwsClient, message_id: str) -> dict[str, str]:
         response = client.run(
@@ -291,11 +336,77 @@ class GmailModule(WorkspaceModule):
         reply_body = f"\n\nOn {sent_at}, {header_value(headers, 'From', 'Unknown sender')} wrote:\n{quoted}".rstrip()
         return {
             "to": sender,
+            "cc": "",
             "subject": subject,
             "body": reply_body,
             "thread_id": response.get("threadId", ""),
             "in_reply_to": message_id_header,
             "references": combined_references or message_id_header,
+        }
+
+    def fetch_reply_all_context(self, client: GwsClient, message_id: str) -> dict[str, str]:
+        response = client.run(
+            "gmail",
+            "users",
+            "messages",
+            "get",
+            params={
+                "userId": "me",
+                "id": message_id,
+                "format": "full",
+            },
+        )
+        payload = response.get("payload", {})
+        headers = payload.get("headers", [])
+        sender = header_value(headers, "Reply-To") or header_value(headers, "From", "")
+        current_user = self.fetch_profile_email(client)
+        sender_addresses = {
+            address.strip().lower()
+            for _, address in getaddresses([sender])
+            if address.strip()
+        }
+        cc_recipients = canonical_addresses(
+            [header_value(headers, "To", ""), header_value(headers, "Cc", "")],
+            exclude=sender_addresses | {current_user},
+        )
+        reply_context = self.fetch_reply_context(client, message_id)
+        reply_context["cc"] = ", ".join(cc_recipients)
+        return reply_context
+
+    def fetch_forward_context(self, client: GwsClient, message_id: str) -> dict[str, str]:
+        response = client.run(
+            "gmail",
+            "users",
+            "messages",
+            "get",
+            params={
+                "userId": "me",
+                "id": message_id,
+                "format": "full",
+            },
+        )
+        payload = response.get("payload", {})
+        headers = payload.get("headers", [])
+        subject = normalize_forward_subject(header_value(headers, "Subject", "No subject"))
+        body = extract_body(payload).strip() or response.get("snippet") or ""
+        lines = [
+            "",
+            "",
+            "---------- Forwarded message ---------",
+            f"From: {header_value(headers, 'From', 'Unknown sender')}",
+            f"Date: {header_value(headers, 'Date', 'Unknown date')}",
+            f"Subject: {header_value(headers, 'Subject', 'No subject')}",
+            f"To: {header_value(headers, 'To', 'Unknown recipient')}",
+        ]
+        cc = header_value(headers, "Cc", "").strip()
+        if cc:
+            lines.append(f"Cc: {cc}")
+        lines.extend(["", body])
+        return {
+            "to": "",
+            "cc": "",
+            "subject": subject,
+            "body": "\n".join(lines).rstrip(),
         }
 
     def reply_to_message(
@@ -304,6 +415,7 @@ class GmailModule(WorkspaceModule):
         to: str,
         subject: str,
         body: str,
+        cc: str,
         thread_id: str,
         in_reply_to: str,
         references: str,
@@ -321,11 +433,55 @@ class GmailModule(WorkspaceModule):
                     to=to,
                     subject=subject,
                     body=body,
+                    cc=cc,
                     in_reply_to=in_reply_to,
                     references=references,
                     attachment_paths=attachment_paths,
                 ),
             },
+        )
+
+    def create_draft(
+        self,
+        client: GwsClient,
+        to: str,
+        subject: str,
+        body: str,
+        cc: str = "",
+        attachment_paths: list[str] | None = None,
+        thread_id: str = "",
+        in_reply_to: str = "",
+        references: str = "",
+    ) -> dict:
+        raw = (
+            self.build_raw_reply_message(
+                to=to,
+                subject=subject,
+                body=body,
+                cc=cc,
+                in_reply_to=in_reply_to,
+                references=references,
+                attachment_paths=attachment_paths,
+            )
+            if thread_id
+            else self.build_raw_message(
+                to=to,
+                subject=subject,
+                body=body,
+                cc=cc,
+                attachment_paths=attachment_paths,
+            )
+        )
+        message: dict[str, Any] = {"raw": raw}
+        if thread_id:
+            message["threadId"] = thread_id
+        return client.run(
+            "gmail",
+            "users",
+            "drafts",
+            "create",
+            params={"userId": "me"},
+            body={"message": message},
         )
 
     def list_user_labels(self, client: GwsClient) -> list[dict[str, Any]]:
@@ -399,14 +555,18 @@ class GmailModule(WorkspaceModule):
         record.raw["label_ids"] = label_ids
         attachments = attachment_names(payload)
         lines = [
+            "Message Overview",
+            "",
             f"Subject: {subject}",
             f"From: {sender}",
             f"To: {recipient}",
             f"Date: {date}",
         ]
+        if label_ids:
+            lines.append(f"Labels: {', '.join(label_ids)}")
         if attachments:
             lines.append(f"Attachments: {', '.join(attachments)}")
-        lines.extend(["", body])
+        lines.extend(["", "Body", "", body])
         return "\n".join(lines)
 
     def fetch_thread_detail(self, client: GwsClient, record: Record, thread_id: str) -> str:
@@ -434,6 +594,8 @@ class GmailModule(WorkspaceModule):
             record.title or "No subject",
         )
         lines = [
+            "Thread Overview",
+            "",
             f"Thread: {thread_subject}",
             f"Messages: {len(messages)}",
             "",
@@ -448,6 +610,7 @@ class GmailModule(WorkspaceModule):
             subject = header_value(headers, "Subject", thread_subject)
             body = extract_body(payload).strip() or message.get("snippet") or "(No message body)"
             attachments = attachment_names(payload)
+            labels = message.get("labelIds", [])
             marker = " [selected]" if message.get("id") == record.key else ""
             lines.extend(
                 [
@@ -458,7 +621,9 @@ class GmailModule(WorkspaceModule):
                     f"Date: {date}",
                 ]
             )
+            if labels:
+                lines.append(f"Labels: {', '.join(labels)}")
             if attachments:
                 lines.append(f"Attachments: {', '.join(attachments)}")
-            lines.extend(["", body, ""])
+            lines.extend(["", "Body", "", body, ""])
         return "\n".join(lines)

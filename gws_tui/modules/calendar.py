@@ -102,6 +102,15 @@ class CalendarModule(WorkspaceModule):
     columns = ("Start", "Calendar", "Title", "Location")
     empty_message = "No upcoming events found."
 
+    def badge(self) -> str:
+        return "Agenda"
+
+    def loading_message(self) -> str:
+        return "Loading this month across your visible calendars..."
+
+    def empty_hint(self) -> str:
+        return "Move with the arrow keys, use [ and ] to change month, or press a to create an event."
+
     def build_event_body(
         self,
         summary: str,

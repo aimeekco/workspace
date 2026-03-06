@@ -60,6 +60,15 @@ class DocsModule(WorkspaceModule):
     columns = ("Title", "Owner", "Modified")
     empty_message = "No Google Docs found."
 
+    def badge(self) -> str:
+        return "Pages"
+
+    def loading_message(self) -> str:
+        return "Loading recent Drive documents..."
+
+    def empty_hint(self) -> str:
+        return "Press n to create a new doc or r to reload recent files."
+
     def fetch_records(self, client: GwsClient) -> list[Record]:
         response = client.run(
             "drive",
@@ -114,9 +123,13 @@ class DocsModule(WorkspaceModule):
         )
         text = extract_document_text(document)
         lines = [
+            "Document Overview",
+            "",
             f"Title: {document.get('title', record.title)}",
             f"Owner: {record.subtitle or 'Unknown'}",
             f"Link: {record.raw.get('webViewLink', 'n/a')}",
+            "",
+            "Contents",
             "",
             text or "(No document text found)",
         ]

@@ -18,6 +18,15 @@ class WorkspaceModule(ABC):
     def subtitle(self) -> str:
         return self.description
 
+    def badge(self) -> str:
+        return self.title
+
+    def loading_message(self) -> str:
+        return f"Loading {self.title.lower()}..."
+
+    def empty_hint(self) -> str:
+        return "Refresh to try again."
+
     @abstractmethod
     def fetch_records(self, client: GwsClient) -> list[Record]:
         raise NotImplementedError

@@ -3,6 +3,7 @@ from __future__ import annotations
 import calendar as calendar_lib
 from datetime import date
 
+from rich import box
 from rich.panel import Panel
 from rich.text import Text
 from textual import work
@@ -10,7 +11,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, ScrollableContainer
 from textual.events import Key
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, ContentSwitcher, DataTable, Footer, Header, Input, ListItem, ListView, Static, TextArea
+from textual.widgets import Button, Checkbox, ContentSwitcher, DataTable, Footer, Header, Input, Static, TextArea
 
 from gws_tui.client import GwsClient, GwsError
 from gws_tui.models import Record
@@ -18,6 +19,12 @@ from gws_tui.modules import WorkspaceModule, built_in_modules
 from gws_tui.modules.calendar import CalendarModule
 from gws_tui.modules.docs import DocsModule
 from gws_tui.modules.gmail import GmailModule
+
+MODULE_ACCENTS = {
+    "gmail": "#88c0d0",
+    "calendar": "#a3be8c",
+    "docs": "#ebcb8b",
+}
 
 
 class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
@@ -31,6 +38,7 @@ class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
         subtitle: str = "Send a plain text Gmail message.",
         submit_label: str = "Send",
         initial_to: str = "",
+        initial_cc: str = "",
         initial_subject: str = "",
         initial_body: str = "",
         initial_attachments: str = "",
@@ -40,6 +48,7 @@ class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
         self.subtitle = subtitle
         self.submit_label = submit_label
         self.initial_to = initial_to
+        self.initial_cc = initial_cc
         self.initial_subject = initial_subject
         self.initial_body = initial_body
         self.initial_attachments = initial_attachments
@@ -49,6 +58,7 @@ class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
             yield Static(self.title, classes="modal-title")
             yield Static(self.subtitle, classes="modal-subtitle")
             yield Input(value=self.initial_to, placeholder="recipient@example.com", id="compose-to")
+            yield Input(value=self.initial_cc, placeholder="cc@example.com, teammate@example.com", id="compose-cc")
             yield Input(value=self.initial_subject, placeholder="Subject", id="compose-subject")
             yield Input(
                 value=self.initial_attachments,
@@ -58,6 +68,7 @@ class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
             yield TextArea(self.initial_body, id="compose-body")
             with Horizontal(classes="modal-actions"):
                 yield Button("Cancel", id="compose-cancel")
+                yield Button("Save Draft", id="compose-draft")
                 yield Button(self.submit_label, variant="primary", id="compose-send")
 
     def on_mount(self) -> None:
@@ -70,27 +81,31 @@ class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
         if event.button.id == "compose-cancel":
             self.dismiss(None)
             return
-        if event.button.id != "compose-send":
+        if event.button.id not in {"compose-send", "compose-draft"}:
             return
         to = self.query_one("#compose-to", Input).value.strip()
+        cc = self.query_one("#compose-cc", Input).value.strip()
         subject = self.query_one("#compose-subject", Input).value.strip()
         attachment_text = self.query_one("#compose-attachments", Input).value.strip()
         body = self.query_one("#compose-body", TextArea).text.strip()
-        if not to:
+        is_send = event.button.id == "compose-send"
+        if is_send and not to:
             self.app.update_status("Compose: recipient is required")
             self.query_one("#compose-to", Input).focus()
             return
-        if not subject:
+        if is_send and not subject:
             self.app.update_status("Compose: subject is required")
             self.query_one("#compose-subject", Input).focus()
             return
-        if not body:
+        if is_send and not body:
             self.app.update_status("Compose: body is required")
             self.query_one("#compose-body", TextArea).focus()
             return
         self.dismiss(
             {
+                "action": "send" if is_send else "draft",
                 "to": to,
+                "cc": cc,
                 "subject": subject,
                 "body": body,
                 "attachments": attachment_text,
@@ -346,8 +361,9 @@ class CalendarGridView(ScrollableContainer):
         self.loaded = False
 
     def compose(self) -> ComposeResult:
-        yield Static(self.module.title, classes="module-title")
-        yield Static(self.module.description, classes="module-description")
+        with Horizontal(classes="module-heading"):
+            yield Static(self.module.title, id="title-calendar", classes="module-title")
+            yield Static(self.module.badge(), id="badge-calendar", classes="module-badge")
         yield Static("", id="calendar-month-label", classes="pane-title")
         with Horizontal(classes="module-body"):
             with Container(classes="pane pane-table"):
@@ -370,7 +386,7 @@ class CalendarGridView(ScrollableContainer):
 
     def action_refresh(self) -> None:
         self.loaded = True
-        self._set_detail_text("Loading calendar...")
+        self._set_detail_text(self._state_text("Loading calendar", self.module.loading_message()))
         self.app.update_status("Loading calendar...")
         self._load_month()
 
@@ -466,11 +482,17 @@ class CalendarGridView(ScrollableContainer):
     def _show_day_preview(self, selected_day: date | None) -> None:
         self.query_one("#detail-label-calendar", Static).update("Day Agenda")
         if selected_day is None:
-            self._set_detail_text("This day is outside the current month.")
+            self._set_detail_text(self._state_text("Out of month", "Move to a date inside the current month to inspect its agenda."))
             return
         records = self.day_records.get(selected_day.isoformat(), [])
         if not records:
-            self._set_detail_text(f"{selected_day.strftime('%A, %B %d')}\n\nNo events.")
+            self._set_detail_text(
+                self._state_text(
+                    selected_day.strftime("%A, %B %d"),
+                    "No events on this day.",
+                    "Press a to create one or move to another date.",
+                )
+            )
             return
         lines = [selected_day.strftime("%A, %B %d"), ""]
         for record in records:
@@ -486,11 +508,25 @@ class CalendarGridView(ScrollableContainer):
     def _handle_error(self, message: str) -> None:
         table = self.query_one("#calendar-grid", DataTable)
         table.clear()
-        self._set_detail_text(f"Error: {message}")
+        self._set_detail_text(self._state_text("Calendar request failed", message))
         self.app.update_status("Calendar: request failed")
 
     def _set_detail_text(self, value: str) -> None:
-        self.query_one("#detail-calendar", Static).update(Panel(Text(value), title="Calendar"))
+        self.query_one("#detail-calendar", Static).update(
+            Panel(
+                Text(value),
+                title="Calendar",
+                subtitle="Agenda",
+                border_style=MODULE_ACCENTS["calendar"],
+                box=box.ROUNDED,
+            )
+        )
+
+    def _state_text(self, heading: str, message: str, hint: str = "") -> str:
+        lines = [heading, "", message]
+        if hint:
+            lines.extend(["", hint])
+        return "\n".join(lines)
 
     def on_data_table_cell_highlighted(self, event: DataTable.CellHighlighted) -> None:
         if event.data_table.id != "calendar-grid":
@@ -521,11 +557,13 @@ class ModuleView(ScrollableContainer):
         self.records: dict[str, Record] = {}
         self.current_key: str | None = None
         self.detail_cache: dict[str, str] = {}
+        self.detail_label = "Preview"
         self.loaded = False
 
     def compose(self) -> ComposeResult:
-        yield Static(self.module.title, id=f"title-{self.module.id}", classes="module-title")
-        yield Static(self.module.subtitle(), id=f"description-{self.module.id}", classes="module-description")
+        with Horizontal(classes="module-heading"):
+            yield Static(self.module.title, id=f"title-{self.module.id}", classes="module-title")
+            yield Static(self.module.badge(), id=f"badge-{self.module.id}", classes="module-badge")
         with Horizontal(classes="module-body"):
             with Container(classes="pane pane-table"):
                 yield Static("Results", classes="pane-title")
@@ -543,6 +581,7 @@ class ModuleView(ScrollableContainer):
         table.cursor_type = "row"
         table.zebra_stripes = True
         table.add_columns(*self.module.columns)
+        table.show_header = True
 
     def load_if_needed(self) -> None:
         if not self.loaded:
@@ -551,14 +590,10 @@ class ModuleView(ScrollableContainer):
     def action_refresh(self) -> None:
         self.loaded = True
         self.detail_cache.clear()
-        self._refresh_header()
-        self.query_one(f"#detail-label-{self.module.id}", Static).update("Preview")
-        self._set_detail_text("Loading data...")
+        self._set_detail_label("Preview")
+        self._set_detail_text(self._state_text(f"Loading {self.module.title}", self.module.loading_message()))
         self.app.update_status(f"Loading {self.module.title.lower()}...")
         self._load_records()
-
-    def _refresh_header(self) -> None:
-        self.query_one(f"#description-{self.module.id}", Static).update(self.module.subtitle())
 
     def show_preview(self, key: str) -> None:
         if key not in self.records:
@@ -566,7 +601,7 @@ class ModuleView(ScrollableContainer):
         self.current_key = key
         record = self.records[key]
         preview = record.preview or f"{record.title}\n{record.subtitle}".strip()
-        self.query_one(f"#detail-label-{self.module.id}", Static).update("Preview")
+        self._set_detail_label("Preview")
         self._set_detail_text(preview)
         self.app.update_status(f"{self.module.title}: preview ready, press Enter for full detail")
 
@@ -574,11 +609,11 @@ class ModuleView(ScrollableContainer):
         if key not in self.records:
             return
         self.current_key = key
-        self.query_one(f"#detail-label-{self.module.id}", Static).update("Detail")
+        self._set_detail_label("Detail")
         if key in self.detail_cache:
             self._render_detail(self.detail_cache[key])
             return
-        self._set_detail_text("Loading full detail...")
+        self._set_detail_text(self._state_text(f"Loading {self.module.title} detail", "Fetching the selected record from Google Workspace..."))
         self.app.update_status(f"Loading {self.module.title.lower()} detail...")
         self._load_detail(key)
 
@@ -600,11 +635,11 @@ class ModuleView(ScrollableContainer):
         try:
             detail = self.module.fetch_detail(self.client, record)
         except GwsError as exc:
-            self.app.call_from_thread(self._set_detail_text, f"Error: {exc.message}")
+            self.app.call_from_thread(self._set_detail_text, self._state_text(f"{self.module.title} detail failed", exc.message))
             self.app.call_from_thread(self.app.update_status, f"{self.module.title} request failed")
             return
         except Exception as exc:  # noqa: BLE001
-            self.app.call_from_thread(self._set_detail_text, f"Error: {exc}")
+            self.app.call_from_thread(self._set_detail_text, self._state_text(f"{self.module.title} detail failed", str(exc)))
             self.app.call_from_thread(self.app.update_status, f"{self.module.title} detail failed")
             return
         self.detail_cache[key] = detail
@@ -615,8 +650,9 @@ class ModuleView(ScrollableContainer):
         table = self.query_one(DataTable)
         table.clear()
         if not records:
-            self.query_one(f"#detail-label-{self.module.id}", Static).update("Preview")
-            self._set_detail_text(self.module.empty_message)
+            self.current_key = None
+            self._set_detail_label("Preview")
+            self._set_detail_text(self._state_text(f"No {self.module.title.lower()} records", self.module.empty_message, self.module.empty_hint()))
             self.app.update_status(f"{self.module.title}: no records")
             return
 
@@ -628,18 +664,48 @@ class ModuleView(ScrollableContainer):
         self.app.update_status(f"{self.module.title}: loaded {len(records)} records")
 
     def _render_detail(self, detail: str) -> None:
-        self.query_one(f"#detail-{self.module.id}", Static).update(Panel(Text(detail), title=self.module.title))
+        self.query_one(f"#detail-{self.module.id}", Static).update(
+            Panel(
+                Text(detail),
+                title=self.module.title,
+                subtitle=self._detail_label_text(),
+                border_style=MODULE_ACCENTS.get(self.module.id, "#3a3a3a"),
+                box=box.ROUNDED,
+            )
+        )
         self.app.update_status(f"{self.module.title}: detail loaded")
 
     def _set_detail_text(self, value: str) -> None:
-        self.query_one(f"#detail-{self.module.id}", Static).update(Panel(Text(value), title=self.module.title))
+        self.query_one(f"#detail-{self.module.id}", Static).update(
+            Panel(
+                Text(value),
+                title=self.module.title,
+                subtitle=self._detail_label_text(),
+                border_style=MODULE_ACCENTS.get(self.module.id, "#3a3a3a"),
+                box=box.ROUNDED,
+            )
+        )
 
     def _handle_error(self, message: str) -> None:
         table = self.query_one(DataTable)
         table.clear()
-        self.query_one(f"#detail-label-{self.module.id}", Static).update("Preview")
-        self._set_detail_text(f"Error: {message}")
+        self.current_key = None
+        self._set_detail_label("Preview")
+        self._set_detail_text(self._state_text(f"{self.module.title} request failed", message))
         self.app.update_status(f"{self.module.title}: request failed")
+
+    def _state_text(self, heading: str, message: str, hint: str = "") -> str:
+        lines = [heading, "", message]
+        if hint:
+            lines.extend(["", hint])
+        return "\n".join(lines)
+
+    def _detail_label_text(self) -> str:
+        return self.detail_label
+
+    def _set_detail_label(self, value: str) -> None:
+        self.detail_label = value
+        self.query_one(f"#detail-label-{self.module.id}", Static).update(value)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.data_table.id != f"table-{self.module.id}" or event.row_key is None:
@@ -666,50 +732,49 @@ class WorkspaceApp(App):
         color: #f2f2f2;
     }
 
+    Header {
+        background: #181818;
+        color: #f2f2f2;
+    }
+
+    Footer {
+        background: #181818;
+        color: #bdbdbd;
+    }
+
     #shell {
         height: 1fr;
         padding: 1 2;
         background: #1b1b1b;
     }
 
-    #workspace {
-        height: 1fr;
-    }
-
-    #sidebar {
-        width: 30;
-        min-width: 30;
-        margin-right: 1;
-        padding: 1 1 0 1;
+    #module-bar {
+        height: auto;
+        margin-bottom: 0;
+        padding: 0;
         background: #202020;
         border: round #3a3a3a;
     }
 
-    #brand {
+    .module-tab {
+        width: auto;
+        min-width: 9;
+        margin-right: 0;
+        padding: 0;
+        background: #1b1b1b;
+        color: #bdbdbd;
+        border: round #343434;
+    }
+
+    .module-tab.-active {
         text-style: bold;
-        color: #f2f2f2;
-        margin-bottom: 1;
-    }
-
-    .section-label {
-        color: #d0d0d0;
-        text-style: bold;
-        margin-bottom: 1;
-    }
-
-    #module-list {
-        height: auto;
-        background: transparent;
-        border: tall #343434;
-        margin-bottom: 1;
-    }
-
-    #sidebar-help {
-        color: #a8a8a8;
+        color: #f4f4f4;
+        background: #252525;
     }
 
     #content-switcher {
         width: 1fr;
+        height: 1fr;
     }
 
     .module-frame {
@@ -722,16 +787,31 @@ class WorkspaceApp(App):
     .module-title {
         color: #f2f2f2;
         text-style: bold;
-        margin-bottom: 1;
+        margin-bottom: 0;
     }
 
     .module-description {
         color: #aaaaaa;
-        margin-bottom: 1;
+        margin: 0 0 0 1;
     }
 
     .module-body {
         height: 1fr;
+    }
+
+    .module-heading {
+        height: auto;
+        align: left middle;
+        margin-bottom: 1;
+    }
+
+    .module-badge {
+        width: auto;
+        margin-left: 1;
+        padding: 0 1;
+        color: #cfcfcf;
+        background: #262626;
+        border: round #343434;
     }
 
     .pane {
@@ -756,9 +836,98 @@ class WorkspaceApp(App):
         padding: 0 0 1 0;
     }
 
+    #frame-gmail {
+        border: round #32464f;
+    }
+
+    #frame-calendar {
+        border: round #44523a;
+    }
+
+    #frame-docs {
+        border: round #5b5131;
+    }
+
+    #title-gmail,
+    #frame-gmail .pane-title,
+    #badge-gmail {
+        color: #88c0d0;
+    }
+
+    #title-calendar,
+    #frame-calendar .pane-title,
+    #badge-calendar {
+        color: #a3be8c;
+    }
+
+    #title-docs,
+    #frame-docs .pane-title,
+    #badge-docs {
+        color: #ebcb8b;
+    }
+
+    #badge-gmail {
+        border: round #32464f;
+        background: #1d262a;
+    }
+
+    #module-tab-gmail.-active {
+        color: #88c0d0;
+        border: round #32464f;
+        background: #1d262a;
+    }
+
+    #badge-calendar {
+        border: round #44523a;
+        background: #22271d;
+    }
+
+    #module-tab-calendar.-active {
+        color: #a3be8c;
+        border: round #44523a;
+        background: #22271d;
+    }
+
+    #badge-docs {
+        border: round #5b5131;
+        background: #29251b;
+    }
+
+    #module-tab-docs.-active {
+        color: #ebcb8b;
+        border: round #5b5131;
+        background: #29251b;
+    }
+
     DataTable {
         height: 1fr;
         background: #1b1b1b;
+    }
+
+    DataTable > .datatable--header {
+        background: #202020;
+        color: #d6d6d6;
+        text-style: bold;
+    }
+
+    DataTable > .datatable--odd-row {
+        background: #1b1b1b;
+    }
+
+    DataTable > .datatable--even-row {
+        background: #1f1f1f;
+    }
+
+    DataTable > .datatable--cursor {
+        background: #2d3138;
+        color: #f7f7f7;
+        text-style: bold;
+    }
+
+    DataTable > .datatable--header-cursor {
+        background: #31353c;
+        color: #f7f7f7;
+        text-style: bold;
     }
 
     #calendar-grid {
@@ -769,7 +938,7 @@ class WorkspaceApp(App):
         height: 1fr;
     }
 
-    ComposeEmailScreen, CreateEventScreen, ConfirmDeleteScreen, LabelEditorScreen, CreateDocumentScreen, EditDocumentScreen {
+    ComposeEmailScreen, CreateEventScreen, ConfirmDeleteScreen, LabelEditorScreen, GmailSearchScreen, CreateDocumentScreen, EditDocumentScreen {
         align: center middle;
     }
 
@@ -785,6 +954,7 @@ class WorkspaceApp(App):
     .modal-title {
         text-style: bold;
         margin-bottom: 1;
+        color: #f2f2f2;
     }
 
     .modal-subtitle {
@@ -829,10 +999,11 @@ class WorkspaceApp(App):
 
     #status {
         dock: bottom;
-        height: 1;
+        height: 2;
         color: #bdbdbd;
         background: #202020;
         padding: 0 2;
+        content-align: left middle;
     }
     """
 
@@ -843,6 +1014,8 @@ class WorkspaceApp(App):
         ("c", "compose_email", "Compose"),
         ("d", "delete_email", "Trash"),
         ("e", "reply_email", "Reply"),
+        ("shift+e", "reply_all_email", "Reply All"),
+        ("f", "forward_email", "Forward"),
         ("l", "edit_labels", "Labels"),
         ("n", "create_doc", "New Doc"),
         ("/", "search_email", "Search"),
@@ -864,33 +1037,19 @@ class WorkspaceApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Container(id="shell"):
-            with Horizontal(id="workspace"):
-                with ScrollableContainer(id="sidebar"):
-                    yield Static("gws workspace", id="brand")
-                    yield Static("Modules", classes="section-label")
-                    yield ListView(
-                        *(
-                            ListItem(Static(f"{index}. {module.title}"), name=module.id)
-                            for index, module in enumerate(self.modules, start=1)
-                        ),
-                        id="module-list",
-                    )
-                    yield Static(
-                        "1-9 switch modules\nTab / Shift+Tab switch modules\nArrow keys move rows\nEnter loads full detail\n/ search gmail\nu toggle unread filter\na add calendar event\n[ / ] change month\nc compose email\nd move to trash\ne reply email\nl edit gmail labels\nn new doc\nw edit doc\nr refresh",
-                        id="sidebar-help",
-                    )
-                with ContentSwitcher(initial=f"frame-{self.current_module_id}", id="content-switcher"):
-                    for module in self.modules:
-                        view = CalendarGridView(module, self.client) if isinstance(module, CalendarModule) else ModuleView(module, self.client)
-                        self.module_views[module.id] = view
-                        with Container(id=f"frame-{module.id}", classes="module-frame"):
-                            yield view
+            with Horizontal(id="module-bar"):
+                for index, module in enumerate(self.modules, start=1):
+                    yield Button(f"{index}. {module.title}", id=f"module-tab-{module.id}", classes="module-tab")
+            with ContentSwitcher(initial=f"frame-{self.current_module_id}", id="content-switcher"):
+                for module in self.modules:
+                    view = CalendarGridView(module, self.client) if isinstance(module, CalendarModule) else ModuleView(module, self.client)
+                    self.module_views[module.id] = view
+                    with Container(id=f"frame-{module.id}", classes="module-frame"):
+                        yield view
         yield Static("Ready", id="status")
         yield Footer()
 
     def on_mount(self) -> None:
-        module_list = self.query_one(ListView)
-        module_list.index = 0
         self._show_module(self.current_module_id)
 
     def on_key(self, event: Key) -> None:
@@ -903,13 +1062,17 @@ class WorkspaceApp(App):
         index = int(event.character) - 1
         if not 0 <= index < len(self.modules):
             return
-        module_list = self.query_one(ListView)
-        module_list.index = index
         self._show_module(self.modules[index].id)
         event.stop()
 
     def update_status(self, message: str) -> None:
-        self.query_one("#status", Static).update(message)
+        module = next((item for item in self.modules if item.id == self.current_module_id), None)
+        badge = module.badge() if module is not None else "Workspace"
+        accent = MODULE_ACCENTS.get(module.id if module is not None else "", "#bdbdbd")
+        status = Text()
+        status.append(f"[{badge}] ", style=f"bold {accent}")
+        status.append(message, style="#c8c8c8")
+        self.query_one("#status", Static).update(status)
 
     def action_refresh(self) -> None:
         self.module_views[self.current_module_id].action_refresh()
@@ -967,6 +1130,30 @@ class WorkspaceApp(App):
         self.update_status("Loading reply context...")
         self._load_reply_context(gmail_module, record.key)
 
+    def action_reply_all_email(self) -> None:
+        gmail_module = self._current_gmail_module()
+        if gmail_module is None:
+            self.update_status("Reply all is only available in Gmail")
+            return
+        record = self.module_views[self.current_module_id].current_record()
+        if record is None:
+            self.update_status("Reply all: no email selected")
+            return
+        self.update_status("Loading reply-all context...")
+        self._load_reply_all_context(gmail_module, record.key)
+
+    def action_forward_email(self) -> None:
+        gmail_module = self._current_gmail_module()
+        if gmail_module is None:
+            self.update_status("Forward is only available in Gmail")
+            return
+        record = self.module_views[self.current_module_id].current_record()
+        if record is None:
+            self.update_status("Forward: no email selected")
+            return
+        self.update_status("Loading forward context...")
+        self._load_forward_context(gmail_module, record.key)
+
     def action_edit_doc(self) -> None:
         docs_module = self._current_docs_module()
         if docs_module is None:
@@ -1004,12 +1191,7 @@ class WorkspaceApp(App):
         self._load_label_editor(gmail_module, record.key, record.title, current_label_ids)
 
     def action_next_module(self) -> None:
-        module_list = self.query_one(ListView)
-        if module_list.index is None:
-            module_list.index = 0
-            return
-        next_index = (module_list.index + 1) % len(self.modules)
-        module_list.index = next_index
+        next_index = (self._current_module_index() + 1) % len(self.modules)
         self._show_module(self.modules[next_index].id)
 
     def action_previous_calendar_month(self) -> None:
@@ -1027,28 +1209,34 @@ class WorkspaceApp(App):
             view.action_next_month()
 
     def action_previous_module(self) -> None:
-        module_list = self.query_one(ListView)
-        if module_list.index is None:
-            module_list.index = 0
-            return
-        next_index = (module_list.index - 1) % len(self.modules)
-        module_list.index = next_index
+        next_index = (self._current_module_index() - 1) % len(self.modules)
         self._show_module(self.modules[next_index].id)
 
-    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
-        if event.list_view.id != "module-list" or event.item is None:
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if not button_id.startswith("module-tab-"):
             return
-        self._show_module(event.item.name or self.current_module_id)
-
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        if event.list_view.id != "module-list" or event.item is None:
-            return
-        self._show_module(event.item.name or self.current_module_id)
+        self._show_module(button_id.removeprefix("module-tab-"))
 
     def _show_module(self, module_id: str) -> None:
         self.current_module_id = module_id
         self.query_one(ContentSwitcher).current = f"frame-{module_id}"
+        self._sync_module_tabs()
         self.module_views[module_id].load_if_needed()
+
+    def _current_module_index(self) -> int:
+        for index, module in enumerate(self.modules):
+            if module.id == self.current_module_id:
+                return index
+        return 0
+
+    def _sync_module_tabs(self) -> None:
+        for module in self.modules:
+            button = self.query_one(f"#module-tab-{module.id}", Button)
+            if module.id == self.current_module_id:
+                button.add_class("-active")
+            else:
+                button.remove_class("-active")
 
     def _current_calendar_module(self) -> CalendarModule | None:
         for module in self.modules:
@@ -1095,13 +1283,26 @@ class WorkspaceApp(App):
         if gmail_module is None:
             self.update_status("Compose is only available in Gmail")
             return
+        attachment_paths = self._parse_attachment_paths(result.get("attachments", ""))
+        if result.get("action") == "draft":
+            self.update_status("Saving draft...")
+            self._save_draft(
+                gmail_module,
+                to=result["to"],
+                cc=result.get("cc", ""),
+                subject=result["subject"],
+                body=result["body"],
+                attachment_paths=attachment_paths,
+            )
+            return
         self.update_status("Sending email...")
         self._send_email(
             gmail_module,
             result["to"],
+            result["cc"],
             result["subject"],
             result["body"],
-            self._parse_attachment_paths(result.get("attachments", "")),
+            attachment_paths,
         )
 
     def _handle_search_result(self, result: str | None) -> None:
@@ -1146,13 +1347,29 @@ class WorkspaceApp(App):
         if gmail_module is None:
             self.update_status("Reply is only available in Gmail")
             return
+        attachment_paths = self._parse_attachment_paths(result.get("attachments", ""))
+        if result.get("action") == "draft":
+            self.update_status("Saving draft...")
+            self._save_draft(
+                gmail_module,
+                to=result["to"],
+                cc=result.get("cc", ""),
+                subject=result["subject"],
+                body=result["body"],
+                attachment_paths=attachment_paths,
+                thread_id=reply_context["thread_id"],
+                in_reply_to=reply_context["in_reply_to"],
+                references=reply_context["references"],
+            )
+            return
         self.update_status("Sending reply...")
         self._send_reply(
             gmail_module,
             to=result["to"],
+            cc=result.get("cc", ""),
             subject=result["subject"],
             body=result["body"],
-            attachment_paths=self._parse_attachment_paths(result.get("attachments", "")),
+            attachment_paths=attachment_paths,
             thread_id=reply_context["thread_id"],
             in_reply_to=reply_context["in_reply_to"],
             references=reply_context["references"],
@@ -1279,6 +1496,7 @@ class WorkspaceApp(App):
         self,
         gmail_module: GmailModule,
         to: str,
+        cc: str,
         subject: str,
         body: str,
         attachment_paths: list[str],
@@ -1287,6 +1505,7 @@ class WorkspaceApp(App):
             gmail_module.send_message(
                 self.client,
                 to=to,
+                cc=cc,
                 subject=subject,
                 body=body,
                 attachment_paths=attachment_paths,
@@ -1301,6 +1520,43 @@ class WorkspaceApp(App):
             self.call_from_thread(self.update_status, f"Send failed: {exc}")
             return
         self.call_from_thread(self.update_status, "Email sent")
+        self.call_from_thread(self.module_views["gmail"].action_refresh)
+
+    @work(thread=True, exclusive=True)
+    def _save_draft(
+        self,
+        gmail_module: GmailModule,
+        to: str,
+        cc: str,
+        subject: str,
+        body: str,
+        attachment_paths: list[str],
+        thread_id: str = "",
+        in_reply_to: str = "",
+        references: str = "",
+    ) -> None:
+        try:
+            gmail_module.create_draft(
+                self.client,
+                to=to,
+                cc=cc,
+                subject=subject,
+                body=body,
+                attachment_paths=attachment_paths,
+                thread_id=thread_id,
+                in_reply_to=in_reply_to,
+                references=references,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            self.call_from_thread(self.update_status, f"Draft failed: {exc}")
+            return
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Draft failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Draft failed: {exc}")
+            return
+        self.call_from_thread(self.update_status, "Draft saved")
         self.call_from_thread(self.module_views["gmail"].action_refresh)
 
     @work(thread=True, exclusive=True)
@@ -1322,6 +1578,7 @@ class WorkspaceApp(App):
                 subtitle="Send a threaded reply. Optional attachments use local file paths.",
                 submit_label="Reply",
                 initial_to=reply_context["to"],
+                initial_cc=reply_context.get("cc", ""),
                 initial_subject=reply_context["subject"],
                 initial_body=reply_context["body"],
             ),
@@ -1329,10 +1586,63 @@ class WorkspaceApp(App):
         )
 
     @work(thread=True, exclusive=True)
+    def _load_reply_all_context(self, gmail_module: GmailModule, message_id: str) -> None:
+        try:
+            reply_context = gmail_module.fetch_reply_all_context(self.client, message_id)
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Reply all failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Reply all failed: {exc}")
+            return
+        self.call_from_thread(self._show_reply_all_screen, reply_context)
+
+    def _show_reply_all_screen(self, reply_context: dict[str, str]) -> None:
+        self.push_screen(
+            ComposeEmailScreen(
+                title="Reply All",
+                subtitle="Reply to the thread sender and include the other recipients.",
+                submit_label="Reply All",
+                initial_to=reply_context["to"],
+                initial_cc=reply_context.get("cc", ""),
+                initial_subject=reply_context["subject"],
+                initial_body=reply_context["body"],
+            ),
+            lambda result: self._handle_reply_result(result, reply_context),
+        )
+
+    @work(thread=True, exclusive=True)
+    def _load_forward_context(self, gmail_module: GmailModule, message_id: str) -> None:
+        try:
+            forward_context = gmail_module.fetch_forward_context(self.client, message_id)
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Forward failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Forward failed: {exc}")
+            return
+        self.call_from_thread(self._show_forward_screen, forward_context)
+
+    def _show_forward_screen(self, forward_context: dict[str, str]) -> None:
+        self.push_screen(
+            ComposeEmailScreen(
+                title="Forward Email",
+                subtitle="Forward the selected email. Original attachments are not reattached automatically.",
+                submit_label="Forward",
+                initial_to=forward_context.get("to", ""),
+                initial_cc=forward_context.get("cc", ""),
+                initial_subject=forward_context["subject"],
+                initial_body=forward_context["body"],
+            ),
+            self._handle_compose_result,
+        )
+
+    @work(thread=True, exclusive=True)
     def _send_reply(
         self,
         gmail_module: GmailModule,
         to: str,
+        cc: str,
         subject: str,
         body: str,
         attachment_paths: list[str],
@@ -1344,6 +1654,7 @@ class WorkspaceApp(App):
             gmail_module.reply_to_message(
                 self.client,
                 to=to,
+                cc=cc,
                 subject=subject,
                 body=body,
                 attachment_paths=attachment_paths,
