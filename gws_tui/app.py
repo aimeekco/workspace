@@ -33,6 +33,12 @@ MODULE_ACCENTS = {
 }
 
 
+class PassiveScrollableContainer(ScrollableContainer):
+    """Scrollable container that doesn't participate in keyboard focus order."""
+
+    can_focus = False
+
+
 class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
     """Compose a plain text email."""
 
@@ -223,7 +229,7 @@ class LabelEditorScreen(ModalScreen[list[str] | None]):
         with Container(id="labels-modal", classes="modal-window"):
             yield Static("Edit Gmail Labels", classes="modal-title")
             yield Static(self.subject or "(No subject)", classes="modal-subtitle")
-            with ScrollableContainer(id="labels-list"):
+            with PassiveScrollableContainer(id="labels-list"):
                 if not self.labels:
                     yield Static("No custom Gmail labels found.", id="labels-empty")
                 for label in self.labels:
@@ -354,7 +360,7 @@ class EditDocumentScreen(ModalScreen[dict[str, str] | None]):
         self.dismiss({"body": body})
 
 
-class CalendarGridView(ScrollableContainer):
+class CalendarGridView(PassiveScrollableContainer):
     """Month-style calendar grid for the Calendar module."""
 
     def __init__(self, module: CalendarModule, client: GwsClient) -> None:
@@ -377,7 +383,7 @@ class CalendarGridView(ScrollableContainer):
                 yield DataTable(id="calendar-grid")
             with Container(classes="pane pane-detail"):
                 yield Static("Day Agenda", id="detail-label-calendar", classes="pane-title")
-                with ScrollableContainer(classes="detail-container"):
+                with PassiveScrollableContainer(classes="detail-container"):
                     yield Static("Select a day to view events.", id="detail-calendar")
 
     def on_mount(self) -> None:
@@ -553,7 +559,7 @@ class CalendarGridView(ScrollableContainer):
         return records[0] if records else None
 
 
-class ModuleView(ScrollableContainer):
+class ModuleView(PassiveScrollableContainer):
     """A reusable list/detail view for a workspace module."""
 
     def __init__(self, module: WorkspaceModule, client: GwsClient) -> None:
@@ -576,7 +582,7 @@ class ModuleView(ScrollableContainer):
                 yield DataTable(id=f"table-{self.module.id}")
             with Container(classes="pane pane-detail"):
                 yield Static("Preview", id=f"detail-label-{self.module.id}", classes="pane-title")
-                with ScrollableContainer(classes="detail-container"):
+                with PassiveScrollableContainer(classes="detail-container"):
                     yield Static(
                         "Select a row to preview. Press Enter for full detail.",
                         id=f"detail-{self.module.id}",
@@ -734,7 +740,7 @@ class ModuleView(ScrollableContainer):
         return self.records.get(self.current_key)
 
 
-class GmailView(ScrollableContainer):
+class GmailView(PassiveScrollableContainer):
     """Gmail-specific three-pane layout with mailbox selector."""
 
     def __init__(self, module: GmailModule, client: GwsClient) -> None:
@@ -760,7 +766,7 @@ class GmailView(ScrollableContainer):
                 yield DataTable(id="table-gmail")
             with Container(classes="pane pane-mail-detail"):
                 yield Static("Preview", id="detail-label-gmail", classes="pane-title")
-                with ScrollableContainer(classes="detail-container"):
+                with PassiveScrollableContainer(classes="detail-container"):
                     yield Static(
                         "Select a row to preview. Press Enter for full detail.",
                         id="detail-gmail",
@@ -1315,7 +1321,7 @@ class Workspace(App):
         yield Header(show_clock=True)
         with Container(id="shell"):
             with Horizontal(id="workspace"):
-                with ScrollableContainer(id="sidebar"):
+                with PassiveScrollableContainer(id="sidebar"):
                     yield Static("Modules", classes="section-label")
                     yield ListView(
                         *(
@@ -1337,7 +1343,7 @@ class Workspace(App):
                         self.module_views[module.id] = view
                         with Container(id=f"frame-{module.id}", classes="module-frame"):
                             yield view
-                with ScrollableContainer(id="activity-pane"):
+                with PassiveScrollableContainer(id="activity-pane"):
                     yield Static("gws activity", id="activity-label")
                     yield Static("", id="activity-log")
         yield Static("Ready", id="status")
