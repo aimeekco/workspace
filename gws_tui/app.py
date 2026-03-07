@@ -1018,7 +1018,7 @@ class Workspace(App):
     .module-heading {
         height: auto;
         align: left middle;
-        margin: 0 1;
+        margin: 0 1 1 1;
     }
 
     #calendar-month-label {
@@ -1028,10 +1028,9 @@ class Workspace(App):
     .module-badge {
         width: auto;
         margin-left: 1;
-        padding: 0 1;
+        padding: 0;
         color: #cfcfcf;
-        background: #262626;
-        border: round #343434;
+        background: transparent;
     }
 
     .pane {
@@ -1098,21 +1097,6 @@ class Workspace(App):
     #frame-docs .pane-title,
     #badge-docs {
         color: #ebcb8b;
-    }
-
-    #badge-gmail {
-        border: round #32464f;
-        background: #1d262a;
-    }
-
-    #badge-calendar {
-        border: round #44523a;
-        background: #22271d;
-    }
-
-    #badge-docs {
-        border: round #5b5131;
-        background: #29251b;
     }
 
     DataTable {
