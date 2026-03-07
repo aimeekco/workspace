@@ -9,6 +9,8 @@ from gws_tui.modules.base import WorkspaceModule
 
 
 SHEETS_MIME_TYPE = "application/vnd.google-apps.spreadsheet"
+DEFAULT_EDIT_COLUMN_COUNT = 26
+DEFAULT_EDIT_ROW_COUNT = 100
 
 
 def parse_timestamp(value: str) -> str:
@@ -18,6 +20,53 @@ def parse_timestamp(value: str) -> str:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone().strftime("%b %d %I:%M %p")
     except ValueError:
         return value
+
+
+def column_label(index: int) -> str:
+    if index < 1:
+        raise ValueError("Column index must be positive")
+    label = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        label = chr(65 + remainder) + label
+    return label
+
+
+def quote_sheet_title(value: str) -> str:
+    escaped = value.replace("'", "''")
+    return f"'{escaped}'"
+
+
+def values_to_grid_text(values: list[list[Any]]) -> str:
+    if not values:
+        return ""
+    string_rows = [[("" if cell is None else str(cell)) for cell in row] for row in values]
+    column_count = max(len(row) for row in string_rows)
+    widths: list[int] = []
+    for column_index in range(column_count):
+        widths.append(
+            max(
+                len(row[column_index]) if column_index < len(row) else 0
+                for row in string_rows
+            )
+        )
+    lines: list[str] = []
+    for row in string_rows:
+        padded = []
+        for column_index, width in enumerate(widths):
+            value = row[column_index] if column_index < len(row) else ""
+            padded.append(value.ljust(width))
+        lines.append(" | ".join(padded).rstrip())
+    return "\n".join(lines)
+
+
+def grid_text_to_values(body: str) -> list[list[str]]:
+    if not body.strip():
+        return []
+    rows: list[list[str]] = []
+    for line in body.splitlines():
+        rows.append([cell.strip() for cell in line.split("|")])
+    return rows
 
 
 class SheetsModule(WorkspaceModule):
@@ -121,6 +170,74 @@ class SheetsModule(WorkspaceModule):
             )
         return "\n".join(lines)
 
+    def fetch_editor_context(self, client: GwsClient, record: Record) -> dict[str, str]:
+        spreadsheet = self._fetch_spreadsheet(client, record.key)
+        properties = spreadsheet.get("properties", {})
+        sheets = spreadsheet.get("sheets", [])
+        if not sheets:
+            raise ValueError("Spreadsheet has no editable tabs")
+        sheet_properties = sheets[0].get("properties", {})
+        sheet_title = sheet_properties.get("title", "Sheet1")
+        edit_range = f"{quote_sheet_title(sheet_title)}!A1:{column_label(DEFAULT_EDIT_COLUMN_COUNT)}{DEFAULT_EDIT_ROW_COUNT}"
+        values_response = client.run(
+            "sheets",
+            "spreadsheets",
+            "values",
+            "get",
+            params={
+                "spreadsheetId": record.key,
+                "range": edit_range,
+            },
+        )
+        return {
+            "spreadsheet_id": record.key,
+            "title": properties.get("title", record.title),
+            "sheet_title": sheet_title,
+            "clear_range": edit_range,
+            "body": values_to_grid_text(values_response.get("values", [])),
+        }
+
+    def update_sheet_values(
+        self,
+        client: GwsClient,
+        spreadsheet_id: str,
+        sheet_title: str,
+        clear_range: str,
+        body: str,
+    ) -> None:
+        client.run(
+            "sheets",
+            "spreadsheets",
+            "values",
+            "clear",
+            params={
+                "spreadsheetId": spreadsheet_id,
+                "range": clear_range,
+            },
+            body={},
+        )
+        values = grid_text_to_values(body)
+        if not values:
+            return
+        max_columns = max(len(row) for row in values)
+        update_range = f"{quote_sheet_title(sheet_title)}!A1:{column_label(max_columns)}{len(values)}"
+        client.run(
+            "sheets",
+            "spreadsheets",
+            "values",
+            "update",
+            params={
+                "spreadsheetId": spreadsheet_id,
+                "range": update_range,
+                "valueInputOption": "USER_ENTERED",
+            },
+            body={
+                "range": update_range,
+                "majorDimension": "ROWS",
+                "values": values,
+            },
+        )
+
     def _collect_items(self, response: dict[str, Any] | list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
         if isinstance(response, list):
             items: list[dict[str, Any]] = []
@@ -128,3 +245,14 @@ class SheetsModule(WorkspaceModule):
                 items.extend(page.get(key, []))
             return items
         return response.get(key, [])
+
+    def _fetch_spreadsheet(self, client: GwsClient, spreadsheet_id: str) -> dict[str, Any]:
+        return client.run(
+            "sheets",
+            "spreadsheets",
+            "get",
+            params={
+                "spreadsheetId": spreadsheet_id,
+                "includeGridData": False,
+            },
+        )

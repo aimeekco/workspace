@@ -764,6 +764,74 @@ class SheetsModuleTest(unittest.TestCase):
         self.assertIn("Named ranges: 1", detail)
         self.assertIn("- Summary (1000x26, frozen 1r/0c)", detail)
 
+    def test_fetch_editor_context_reads_first_tab_values(self) -> None:
+        client = StubClient()
+        module = SheetsModule()
+        client.add(
+            ("sheets", "spreadsheets", "get", "[('includeGridData', False), ('spreadsheetId', 'sheet-1')]"),
+            {
+                "properties": {"title": "Budget"},
+                "sheets": [{"properties": {"title": "Summary"}}],
+            },
+        )
+        client.add(
+            ("sheets", "spreadsheets", "values", "get", "[('range', \"'Summary'!A1:Z100\"), ('spreadsheetId', 'sheet-1')]"),
+            {
+                "values": [
+                    ["Name", "Amount"],
+                    ["Rent", "1200"],
+                ]
+            },
+        )
+        record = Record(
+            key="sheet-1",
+            columns=("Budget", "Aimee", "Mar 07 10:00 AM"),
+            title="Budget",
+            subtitle="Aimee",
+            raw={},
+        )
+
+        context = module.fetch_editor_context(client, record)  # type: ignore[arg-type]
+
+        self.assertEqual(context["title"], "Budget")
+        self.assertEqual(context["sheet_title"], "Summary")
+        self.assertEqual(context["clear_range"], "'Summary'!A1:Z100")
+        self.assertEqual(context["body"], "Name | Amount\nRent | 1200")
+
+    def test_update_sheet_values_clears_then_updates(self) -> None:
+        client = StubClient()
+        module = SheetsModule()
+        client.add(
+            ("sheets", "spreadsheets", "values", "clear", "[('range', \"'Summary'!A1:Z100\"), ('spreadsheetId', 'sheet-1')]"),
+            {},
+        )
+        client.add(
+            (
+                "sheets",
+                "spreadsheets",
+                "values",
+                "update",
+                "[('range', \"'Summary'!A1:B2\"), ('spreadsheetId', 'sheet-1'), ('valueInputOption', 'USER_ENTERED')]",
+            ),
+            {"updatedRange": "'Summary'!A1:B2"},
+        )
+
+        module.update_sheet_values(  # type: ignore[arg-type]
+            client,
+            spreadsheet_id="sheet-1",
+            sheet_title="Summary",
+            clear_range="'Summary'!A1:Z100",
+            body="Name | Amount\nRent | 1200",
+        )
+
+        self.assertEqual(client.calls[0][1], ("spreadsheets", "values", "clear"))
+        self.assertEqual(client.calls[1][1], ("spreadsheets", "values", "update"))
+        self.assertEqual(client.calls[1][2]["range"], "'Summary'!A1:B2")
+        self.assertEqual(
+            client.calls[1][3]["values"],
+            [["Name", "Amount"], ["Rent", "1200"]],
+        )
+
 
 class DriveModuleTest(unittest.TestCase):
     def test_drive_kind_maps_common_mime_types(self) -> None:

@@ -23,6 +23,7 @@ from gws_tui.modules.calendar import CalendarModule
 from gws_tui.modules.drive import DriveModule
 from gws_tui.modules.docs import DocsModule
 from gws_tui.modules.gmail import GmailModule
+from gws_tui.modules.sheets import SheetsModule
 
 MODULE_ACCENTS = {
     "gmail": "#88c0d0",
@@ -357,6 +358,43 @@ class EditDocumentScreen(ModalScreen[dict[str, str] | None]):
         if event.button.id != "doc-edit-submit":
             return
         body = self.query_one("#doc-edit-body", TextArea).text
+        self.dismiss({"body": body})
+
+
+class EditSheetScreen(ModalScreen[dict[str, str] | None]):
+    """Edit Google Sheets cell data as aligned columns."""
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, title: str, sheet_title: str, body: str) -> None:
+        super().__init__()
+        self.title = title
+        self.sheet_title = sheet_title
+        self.body = body
+
+    def compose(self) -> ComposeResult:
+        with Container(id="sheet-edit-modal", classes="modal-window"):
+            yield Static("Edit Google Sheet", classes="modal-title")
+            yield Static(f"{self.title} · {self.sheet_title}", classes="modal-subtitle")
+            yield Static("Edit rows as aligned columns. Keep `|` between cells; long rows scroll horizontally.", classes="modal-subtitle")
+            yield TextArea(self.body, id="sheet-edit-body", soft_wrap=False)
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel", id="sheet-edit-cancel")
+                yield Button("Save", variant="primary", id="sheet-edit-submit")
+
+    def on_mount(self) -> None:
+        self.query_one("#sheet-edit-body", TextArea).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "sheet-edit-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id != "sheet-edit-submit":
+            return
+        body = self.query_one("#sheet-edit-body", TextArea).text
         self.dismiss({"body": body})
 
 
@@ -1218,7 +1256,7 @@ class Workspace(App):
         border: tall #343434;
     }
 
-    ComposeEmailScreen, CreateEventScreen, ConfirmDeleteScreen, LabelEditorScreen, GmailSearchScreen, CreateDocumentScreen, EditDocumentScreen {
+    ComposeEmailScreen, CreateEventScreen, ConfirmDeleteScreen, LabelEditorScreen, GmailSearchScreen, CreateDocumentScreen, EditDocumentScreen, EditSheetScreen {
         align: center middle;
     }
 
@@ -1229,6 +1267,12 @@ class Workspace(App):
         padding: 1 2;
         background: #202020;
         border: round #3a3a3a;
+    }
+
+    #sheet-edit-modal {
+        width: 118;
+        height: 88%;
+        max-width: 96%;
     }
 
     .modal-title {
@@ -1257,9 +1301,13 @@ class Workspace(App):
         margin-bottom: 1;
     }
 
-    #compose-body, #event-description, #doc-create-body, #doc-edit-body {
+    #compose-body, #event-description, #doc-create-body, #doc-edit-body, #sheet-edit-body {
         height: 12;
         margin-bottom: 1;
+    }
+
+    #sheet-edit-body {
+        height: 1fr;
     }
 
     #confirm-message {
@@ -1304,7 +1352,7 @@ class Workspace(App):
         ("]", "next_calendar_month", "Next Month"),
         ("tab", "next_module", "Next"),
         ("shift+tab", "previous_module", "Prev"),
-        ("w", "edit_doc", "Edit Doc"),
+        ("w", "edit_doc", "Edit"),
     ]
 
     def __init__(self, client: GwsClient | None = None) -> None:
@@ -1489,16 +1537,31 @@ class Workspace(App):
         self._load_forward_context(gmail_module, record.key)
 
     def action_edit_doc(self) -> None:
-        docs_module = self._current_docs_module()
-        if docs_module is None:
-            self.update_status("Edit doc is only available in Docs")
+        if self.current_module_id == "docs":
+            docs_module = self._current_docs_module()
+            if docs_module is None:
+                self.update_status("Edit is only available in Docs and Sheets")
+                return
+            record = self.module_views[self.current_module_id].current_record()
+            if record is None:
+                self.update_status("Edit doc: no document selected")
+                return
+            self.update_status("Loading document editor...")
+            self._load_doc_editor(docs_module, record)
             return
-        record = self.module_views[self.current_module_id].current_record()
-        if record is None:
-            self.update_status("Edit doc: no document selected")
+        if self.current_module_id == "sheets":
+            sheets_module = self._current_sheets_module()
+            if sheets_module is None:
+                self.update_status("Edit is only available in Docs and Sheets")
+                return
+            record = self.module_views[self.current_module_id].current_record()
+            if record is None:
+                self.update_status("Edit sheet: no spreadsheet selected")
+                return
+            self.update_status("Loading sheet editor...")
+            self._load_sheet_editor(sheets_module, record)
             return
-        self.update_status("Loading document editor...")
-        self._load_doc_editor(docs_module, record)
+        self.update_status("Edit is only available in Docs and Sheets")
 
     def action_delete_email(self) -> None:
         gmail_module = self._current_gmail_module()
@@ -1589,6 +1652,12 @@ class Workspace(App):
                 return module
         return None
 
+    def _current_sheets_module(self) -> SheetsModule | None:
+        for module in self.modules:
+            if module.id == self.current_module_id and isinstance(module, SheetsModule):
+                return module
+        return None
+
     def _handle_event_result(self, result: dict[str, str] | None) -> None:
         if result is None:
             self.update_status("Event creation cancelled")
@@ -1671,6 +1740,23 @@ class Workspace(App):
             return
         self.update_status("Saving document...")
         self._save_doc(docs_module, record.key, result["body"])
+
+    def _handle_edit_sheet_result(self, result: dict[str, str] | None, context: dict[str, str]) -> None:
+        if result is None:
+            self.update_status("Sheet edit cancelled")
+            return
+        sheets_module = self._current_sheets_module()
+        if sheets_module is None:
+            self.update_status("Edit is only available in Docs and Sheets")
+            return
+        self.update_status("Saving sheet...")
+        self._save_sheet(
+            sheets_module,
+            spreadsheet_id=context["spreadsheet_id"],
+            sheet_title=context["sheet_title"],
+            clear_range=context["clear_range"],
+            body=result["body"],
+        )
 
     def _handle_reply_result(self, result: dict[str, str] | None, reply_context: dict[str, str]) -> None:
         if result is None:
@@ -1812,6 +1898,24 @@ class Workspace(App):
         )
 
     @work(thread=True, exclusive=True)
+    def _load_sheet_editor(self, sheets_module: SheetsModule, record: Record) -> None:
+        try:
+            context = sheets_module.fetch_editor_context(self.client, record)
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Sheet editor failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Sheet editor failed: {exc}")
+            return
+        self.call_from_thread(self._show_sheet_editor, context)
+
+    def _show_sheet_editor(self, context: dict[str, str]) -> None:
+        self.push_screen(
+            EditSheetScreen(context["title"], context["sheet_title"], context["body"]),
+            lambda result: self._handle_edit_sheet_result(result, context),
+        )
+
+    @work(thread=True, exclusive=True)
     def _save_doc(self, docs_module: DocsModule, document_id: str, body: str) -> None:
         try:
             docs_module.update_document_text(self.client, document_id=document_id, body=body)
@@ -1823,6 +1927,32 @@ class Workspace(App):
             return
         self.call_from_thread(self.update_status, "Document saved")
         self.call_from_thread(self.module_views["docs"].action_refresh)
+
+    @work(thread=True, exclusive=True)
+    def _save_sheet(
+        self,
+        sheets_module: SheetsModule,
+        spreadsheet_id: str,
+        sheet_title: str,
+        clear_range: str,
+        body: str,
+    ) -> None:
+        try:
+            sheets_module.update_sheet_values(
+                self.client,
+                spreadsheet_id=spreadsheet_id,
+                sheet_title=sheet_title,
+                clear_range=clear_range,
+                body=body,
+            )
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Sheet save failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Sheet save failed: {exc}")
+            return
+        self.call_from_thread(self.update_status, "Sheet saved")
+        self.call_from_thread(self.module_views["sheets"].action_refresh)
 
     @work(thread=True, exclusive=True)
     def _send_email(
