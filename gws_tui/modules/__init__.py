@@ -3,6 +3,7 @@ from .calendar import CalendarModule
 from .drive import DriveModule
 from .docs import DocsModule
 from .gmail import GmailModule
+from .sheets import SheetsModule
 
 
 def built_in_modules() -> list[WorkspaceModule]:
@@ -10,7 +11,16 @@ def built_in_modules() -> list[WorkspaceModule]:
         GmailModule(),
         CalendarModule(),
         DriveModule(),
+        SheetsModule(),
         DocsModule(),
     ]
 
-__all__ = ["WorkspaceModule", "CalendarModule", "DriveModule", "DocsModule", "GmailModule", "built_in_modules"]
+__all__ = [
+    "WorkspaceModule",
+    "CalendarModule",
+    "DriveModule",
+    "DocsModule",
+    "GmailModule",
+    "SheetsModule",
+    "built_in_modules",
+]

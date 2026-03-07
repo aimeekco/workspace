@@ -11,6 +11,7 @@ from gws_tui.modules.calendar import CalendarModule, event_day_keys, format_even
 from gws_tui.modules.drive import DriveModule, drive_kind
 from gws_tui.modules.docs import DocsModule, document_body_end_index, extract_document_text
 from gws_tui.modules.gmail import GmailModule, extract_body, format_message_date, normalize_forward_subject, normalize_reply_subject
+from gws_tui.modules.sheets import SheetsModule
 
 
 class StubClient:
@@ -675,6 +676,93 @@ class DocsModuleTest(unittest.TestCase):
         requests = client.calls[-1][3]["requests"]
         self.assertEqual(requests[0]["deleteContentRange"]["range"], {"startIndex": 1, "endIndex": 14})
         self.assertEqual(requests[1]["insertText"]["text"], "Updated text")
+
+
+class SheetsModuleTest(unittest.TestCase):
+    def test_fetch_records_lists_recent_sheets(self) -> None:
+        client = StubClient()
+        module = SheetsModule()
+        client.add(
+            (
+                "drive",
+                "files",
+                "list",
+                repr(
+                    sorted(
+                        {
+                            "q": "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
+                            "pageSize": 25,
+                            "orderBy": "modifiedTime desc",
+                            "supportsAllDrives": True,
+                            "includeItemsFromAllDrives": True,
+                        }.items()
+                    )
+                ),
+            ),
+            [
+                {
+                    "files": [
+                        {
+                            "id": "sheet-1",
+                            "name": "Budget",
+                            "modifiedTime": "2026-03-07T10:00:00Z",
+                            "webViewLink": "https://docs.google.com/spreadsheets/d/sheet-1/edit",
+                            "owners": [{"displayName": "Aimee"}],
+                        }
+                    ]
+                }
+            ],
+        )
+
+        records = module.fetch_records(client)  # type: ignore[arg-type]
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].title, "Budget")
+        self.assertEqual(records[0].subtitle, "Aimee")
+        self.assertIn("docs.google.com/spreadsheets", records[0].preview)
+
+    def test_fetch_detail_reads_spreadsheet_metadata(self) -> None:
+        client = StubClient()
+        module = SheetsModule()
+        client.add(
+            ("sheets", "spreadsheets", "get", "[('includeGridData', False), ('spreadsheetId', 'sheet-1')]"),
+            {
+                "properties": {
+                    "title": "Budget",
+                    "locale": "en_US",
+                    "timeZone": "America/Los_Angeles",
+                },
+                "sheets": [
+                    {
+                        "properties": {
+                            "title": "Summary",
+                            "gridProperties": {
+                                "rowCount": 1000,
+                                "columnCount": 26,
+                                "frozenRowCount": 1,
+                                "frozenColumnCount": 0,
+                            },
+                        }
+                    }
+                ],
+                "namedRanges": [{"name": "Totals"}],
+            },
+        )
+        record = Record(
+            key="sheet-1",
+            columns=("Budget", "Aimee", "Mar 07 10:00 AM"),
+            title="Budget",
+            subtitle="Aimee",
+            raw={"webViewLink": "https://docs.google.com/spreadsheets/d/sheet-1/edit"},
+        )
+
+        detail = module.fetch_detail(client, record)  # type: ignore[arg-type]
+
+        self.assertIn("Spreadsheet Overview", detail)
+        self.assertIn("Title: Budget", detail)
+        self.assertIn("Tabs: 1", detail)
+        self.assertIn("Named ranges: 1", detail)
+        self.assertIn("- Summary (1000x26, frozen 1r/0c)", detail)
 
 
 class DriveModuleTest(unittest.TestCase):

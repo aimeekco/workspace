@@ -27,6 +27,8 @@ from gws_tui.modules.gmail import GmailModule
 MODULE_ACCENTS = {
     "gmail": "#88c0d0",
     "calendar": "#a3be8c",
+    "drive": "#81a1c1",
+    "sheets": "#b8d78d",
     "docs": "#ebcb8b",
 }
 
