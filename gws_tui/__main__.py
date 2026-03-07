@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from gws_tui.app import WorkspaceApp
+from gws_tui.app import Workspace
 
 
 def main() -> None:
-    WorkspaceApp().run()
+    Workspace().run()
 
 
 if __name__ == "__main__":

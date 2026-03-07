@@ -1,5 +1,5 @@
 """Google Workspace TUI package."""
 
-from .app import WorkspaceApp
+from .app import Workspace
 
-__all__ = ["WorkspaceApp"]
+__all__ = ["Workspace"]

@@ -941,8 +941,10 @@ class GmailView(ScrollableContainer):
         return self.records.get(self.current_key)
 
 
-class WorkspaceApp(App):
+class Workspace(App):
     """Unified Google Workspace TUI backed by gws."""
+
+    TITLE = "workspace"
 
     CSS = """
     App {
