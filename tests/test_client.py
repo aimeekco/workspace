@@ -4,7 +4,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from gws_tui.client import GwsClient, GwsError
+from gws_tui.client import GwsClient, GwsCommandEvent, GwsError
 
 
 class GwsClientTest(unittest.TestCase):
@@ -48,6 +48,21 @@ class GwsClientTest(unittest.TestCase):
             result = client.run("calendar", "events", "list", page_all=True)
 
         self.assertEqual(result, [{"items": [1]}, {"items": [2]}])
+
+    def test_run_emits_observer_events(self) -> None:
+        events: list[GwsCommandEvent] = []
+        client = GwsClient(observer=events.append)
+        completed = subprocess.CompletedProcess(
+            args=["gws"],
+            returncode=0,
+            stdout='{"items": [{"id": "abc"}]}',
+            stderr="",
+        )
+        with patch("subprocess.run", return_value=completed):
+            client.run("calendar", "calendarList", "list")
+
+        self.assertEqual([event.status for event in events], ["start", "ok"])
+        self.assertEqual(events[0].command[:3], ["gws", "calendar", "calendarList"])
 
 
 if __name__ == "__main__":

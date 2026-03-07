@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import calendar as calendar_lib
+from collections import deque
 from datetime import date
+from datetime import datetime
 
 from rich import box
+from rich.console import Group
 from rich.panel import Panel
 from rich.text import Text
 from textual import work
@@ -13,7 +16,7 @@ from textual.events import Key
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, ContentSwitcher, DataTable, Footer, Header, Input, ListItem, ListView, Static, TextArea
 
-from gws_tui.client import GwsClient, GwsError
+from gws_tui.client import GwsClient, GwsCommandEvent, GwsError
 from gws_tui.models import Record
 from gws_tui.modules import WorkspaceModule, built_in_modules
 from gws_tui.modules.calendar import CalendarModule
@@ -1029,6 +1032,26 @@ class Workspace(App):
     #content-switcher {
         width: 1fr;
         height: 1fr;
+        margin-right: 1;
+    }
+
+    #activity-pane {
+        width: 28;
+        min-width: 28;
+        padding: 1 0;
+        background: #202020;
+        border: round #3a3a3a;
+    }
+
+    #activity-label {
+        color: #d0d0d0;
+        text-style: bold;
+        margin: 0 1 1 1;
+    }
+
+    #activity-log {
+        height: 1fr;
+        margin: 0 1;
     }
 
     .module-frame {
@@ -1278,7 +1301,10 @@ class Workspace(App):
 
     def __init__(self, client: GwsClient | None = None) -> None:
         super().__init__()
+        self.activity_lines: deque[Text] = deque(maxlen=60)
         self.client = client or GwsClient()
+        if isinstance(self.client, GwsClient):
+            self.client.observer = self._on_gws_event
         self.modules = built_in_modules()
         self.module_views: dict[str, ModuleView] = {}
         self.current_module_id = self.modules[0].id
@@ -1309,6 +1335,9 @@ class Workspace(App):
                         self.module_views[module.id] = view
                         with Container(id=f"frame-{module.id}", classes="module-frame"):
                             yield view
+                with ScrollableContainer(id="activity-pane"):
+                    yield Static("gws activity", id="activity-label")
+                    yield Static("", id="activity-log")
         yield Static("Ready", id="status")
         yield Footer()
 
@@ -1340,6 +1369,36 @@ class Workspace(App):
         status.append(f"[{badge}] ", style=f"bold {accent}")
         status.append(message, style="#c8c8c8")
         self.query_one("#status", Static).update(status)
+
+    def _on_gws_event(self, event: GwsCommandEvent) -> None:
+        self.call_from_thread(self._record_gws_event, event)
+
+    def _record_gws_event(self, event: GwsCommandEvent) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        command_text = self._format_gws_command(event.command)
+        entry = Text()
+        entry.append(timestamp, style="#7f848e")
+        entry.append("\n")
+        entry.append(f"[{event.status}] ", style=f"bold {self._activity_status_color(event.status)}")
+        entry.append(command_text, style="#d8dee9")
+        if event.detail:
+            entry.append(f"\n{event.detail}", style="#a7adba")
+        self.activity_lines.appendleft(entry)
+        self.query_one("#activity-log", Static).update(Group(*self.activity_lines))
+
+    def _format_gws_command(self, command: list[str]) -> str:
+        if len(command) <= 4:
+            return " ".join(command)
+        if len(command) >= 4 and command[0] == "gws":
+            return f"{command[1]} {' '.join(command[2:4])}"
+        return " ".join(command[:3])
+
+    def _activity_status_color(self, status: str) -> str:
+        if status == "ok":
+            return "#a3be8c"
+        if status == "error":
+            return "#bf616a"
+        return "#88c0d0"
 
     def action_refresh(self) -> None:
         self.module_views[self.current_module_id].action_refresh()

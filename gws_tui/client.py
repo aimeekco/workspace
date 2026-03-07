@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 
 class GwsError(RuntimeError):
@@ -16,10 +16,20 @@ class GwsError(RuntimeError):
 
 
 @dataclass(slots=True)
+class GwsCommandEvent:
+    """Lifecycle event for a gws command."""
+
+    command: list[str]
+    status: str
+    detail: str = ""
+
+
+@dataclass(slots=True)
 class GwsClient:
     """Thin wrapper around the gws CLI."""
 
     binary: str = "gws"
+    observer: Callable[[GwsCommandEvent], None] | None = None
 
     def run(
         self,
@@ -38,6 +48,8 @@ class GwsClient:
         if page_all:
             command.extend(["--page-all", "--page-limit", str(page_limit)])
 
+        self._emit(command, "start")
+
         result = subprocess.run(
             command,
             capture_output=True,
@@ -46,15 +58,27 @@ class GwsClient:
         )
         if result.returncode != 0:
             stderr = result.stderr.strip() or "gws command failed"
+            self._emit(command, "error", stderr)
             raise GwsError(command, stderr)
 
         stdout = result.stdout.strip()
         if not stdout:
+            self._emit(command, "ok", "empty")
             return {}
 
         try:
             if page_all:
-                return [json.loads(line) for line in stdout.splitlines() if line.strip()]
-            return json.loads(stdout)
+                parsed = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+                self._emit(command, "ok", f"{len(parsed)} pages")
+                return parsed
+            parsed = json.loads(stdout)
+            self._emit(command, "ok")
+            return parsed
         except json.JSONDecodeError as exc:
+            self._emit(command, "error", f"Invalid JSON response: {exc}")
             raise GwsError(command, f"Invalid JSON response: {exc}") from exc
+
+    def _emit(self, command: list[str], status: str, detail: str = "") -> None:
+        if self.observer is None:
+            return
+        self.observer(GwsCommandEvent(command=list(command), status=status, detail=detail))
