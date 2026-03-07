@@ -11,7 +11,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, ScrollableContainer
 from textual.events import Key
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, ContentSwitcher, DataTable, Footer, Header, Input, Static, TextArea
+from textual.widgets import Button, Checkbox, ContentSwitcher, DataTable, Footer, Header, Input, ListItem, ListView, Static, TextArea
 
 from gws_tui.client import GwsClient, GwsError
 from gws_tui.models import Record
@@ -566,7 +566,7 @@ class ModuleView(ScrollableContainer):
             yield Static(self.module.badge(), id=f"badge-{self.module.id}", classes="module-badge")
         with Horizontal(classes="module-body"):
             with Container(classes="pane pane-table"):
-                yield Static("Results", classes="pane-title")
+                yield Static(self.module.list_label(), classes="pane-title")
                 yield DataTable(id=f"table-{self.module.id}")
             with Container(classes="pane pane-detail"):
                 yield Static("Preview", id=f"detail-label-{self.module.id}", classes="pane-title")
@@ -723,6 +723,224 @@ class ModuleView(ScrollableContainer):
         return self.records.get(self.current_key)
 
 
+class GmailView(ScrollableContainer):
+    """Gmail-specific three-pane layout with mailbox selector."""
+
+    def __init__(self, module: GmailModule, client: GwsClient) -> None:
+        super().__init__(id=f"view-{module.id}")
+        self.module = module
+        self.client = client
+        self.records: dict[str, Record] = {}
+        self.current_key: str | None = None
+        self.detail_cache: dict[str, str] = {}
+        self.detail_label = "Preview"
+        self.loaded = False
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="module-heading"):
+            yield Static(self.module.title, id="title-gmail", classes="module-title")
+            yield Static(self.module.badge(), id="badge-gmail", classes="module-badge")
+        with Horizontal(classes="module-body"):
+            with Container(id="pane-mailboxes-gmail", classes="pane pane-mailboxes"):
+                yield Static("Mailboxes", classes="pane-title")
+                yield ListView(id="mailbox-list-gmail")
+            with Container(classes="pane pane-mail"):
+                yield Static(self.module.list_label(), id="mailbox-heading-gmail", classes="pane-title")
+                yield DataTable(id="table-gmail")
+            with Container(classes="pane pane-mail-detail"):
+                yield Static("Preview", id="detail-label-gmail", classes="pane-title")
+                with ScrollableContainer(classes="detail-container"):
+                    yield Static(
+                        "Select a row to preview. Press Enter for full detail.",
+                        id="detail-gmail",
+                    )
+
+    def on_mount(self) -> None:
+        table = self.query_one("#table-gmail", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_column("Subject", width=38)
+        table.add_column("From", width=26)
+        table.add_column("Time", width=16)
+        table.show_header = True
+
+    def load_if_needed(self) -> None:
+        if not self.loaded:
+            self.action_refresh()
+
+    def action_refresh(self) -> None:
+        self.loaded = True
+        self.detail_cache.clear()
+        self._set_detail_label("Preview")
+        self._refresh_mailbox_heading()
+        self._set_detail_text(self._state_text("Loading Gmail", self.module.loading_message()))
+        self.app.update_status("Loading gmail...")
+        self._load_records()
+
+    @work(thread=True, exclusive=True)
+    def _load_records(self) -> None:
+        try:
+            records = self.module.fetch_records(self.client)
+        except GwsError as exc:
+            self.app.call_from_thread(self._handle_error, exc.message)
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.app.call_from_thread(self._handle_error, str(exc))
+            return
+        self.app.call_from_thread(self._render_records, records)
+
+    @work(thread=True, exclusive=True)
+    def _load_detail(self, key: str) -> None:
+        record = self.records[key]
+        try:
+            detail = self.module.fetch_detail(self.client, record)
+        except GwsError as exc:
+            self.app.call_from_thread(self._set_detail_text, self._state_text("Gmail detail failed", exc.message))
+            self.app.call_from_thread(self.app.update_status, "Gmail request failed")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.app.call_from_thread(self._set_detail_text, self._state_text("Gmail detail failed", str(exc)))
+            self.app.call_from_thread(self.app.update_status, "Gmail detail failed")
+            return
+        self.detail_cache[key] = detail
+        self.app.call_from_thread(self._render_detail, detail)
+
+    def _render_records(self, records: list[Record]) -> None:
+        self._render_mailboxes()
+        self._refresh_mailbox_heading()
+        self.records = {record.key: record for record in records}
+        table = self.query_one("#table-gmail", DataTable)
+        table.clear()
+        if not records:
+            self.current_key = None
+            self._set_detail_label("Preview")
+            self._set_detail_text(self._state_text("No gmail records", self.module.empty_message, self.module.empty_hint()))
+            self.app.update_status("Gmail: no records")
+            return
+
+        first_key = records[0].key
+        for record in records:
+            table.add_row(*record.columns, key=record.key)
+        table.move_cursor(row=0, column=0)
+        self.show_preview(first_key)
+        self.app.update_status(f"Gmail: loaded {len(records)} records")
+
+    def _render_mailboxes(self) -> None:
+        mailbox_list = self.query_one("#mailbox-list-gmail", ListView)
+        mailbox_list.clear()
+        selected_index = 0
+        for index, mailbox in enumerate(self.module.mailboxes):
+            mailbox_list.append(ListItem(Static(mailbox["name"]), name=mailbox["id"]))
+            if mailbox["id"] == self.module.selected_mailbox_id:
+                selected_index = index
+        if self.module.mailboxes:
+            mailbox_list.index = selected_index
+        self._apply_mailbox_width()
+
+    def _apply_mailbox_width(self) -> None:
+        longest = max(
+            [len("Mailboxes"), *(len(mailbox["name"]) for mailbox in self.module.mailboxes)],
+            default=len("Mailboxes"),
+        )
+        # Account for the pane border and a small amount of inner padding.
+        width = max(15, longest + 5)
+        self.query_one("#pane-mailboxes-gmail", Container).styles.width = width
+
+    def _refresh_mailbox_heading(self) -> None:
+        self.query_one("#mailbox-heading-gmail", Static).update(self.module.list_label())
+
+    def show_preview(self, key: str) -> None:
+        if key not in self.records:
+            return
+        self.current_key = key
+        record = self.records[key]
+        preview = record.preview or f"{record.title}\n{record.subtitle}".strip()
+        self._set_detail_label("Preview")
+        self._set_detail_text(preview)
+        self.app.update_status("Gmail: preview ready, press Enter for full detail")
+
+    def open_record(self, key: str) -> None:
+        if key not in self.records:
+            return
+        self.current_key = key
+        self._set_detail_label("Detail")
+        if key in self.detail_cache:
+            self._render_detail(self.detail_cache[key])
+            return
+        self._set_detail_text(self._state_text("Loading Gmail detail", "Fetching the selected message or thread..."))
+        self.app.update_status("Loading gmail detail...")
+        self._load_detail(key)
+
+    def _render_detail(self, detail: str) -> None:
+        self.query_one("#detail-gmail", Static).update(
+            Panel(
+                Text(detail),
+                title=self.module.title,
+                subtitle=self.detail_label,
+                border_style=MODULE_ACCENTS["gmail"],
+                box=box.ROUNDED,
+            )
+        )
+        self.app.update_status("Gmail: detail loaded")
+
+    def _set_detail_text(self, value: str) -> None:
+        self.query_one("#detail-gmail", Static).update(
+            Panel(
+                Text(value),
+                title=self.module.title,
+                subtitle=self.detail_label,
+                border_style=MODULE_ACCENTS["gmail"],
+                box=box.ROUNDED,
+            )
+        )
+
+    def _handle_error(self, message: str) -> None:
+        self._render_mailboxes()
+        self._refresh_mailbox_heading()
+        table = self.query_one("#table-gmail", DataTable)
+        table.clear()
+        self.current_key = None
+        self._set_detail_label("Preview")
+        self._set_detail_text(self._state_text("Gmail request failed", message))
+        self.app.update_status("Gmail: request failed")
+
+    def _set_detail_label(self, value: str) -> None:
+        self.detail_label = value
+        self.query_one("#detail-label-gmail", Static).update(value)
+
+    def _state_text(self, heading: str, message: str, hint: str = "") -> str:
+        lines = [heading, "", message]
+        if hint:
+            lines.extend(["", hint])
+        return "\n".join(lines)
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id != "table-gmail" or event.row_key is None:
+            return
+        self.show_preview(str(event.row_key.value))
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "table-gmail" or event.row_key is None:
+            return
+        self.open_record(str(event.row_key.value))
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.list_view.id != "mailbox-list-gmail" or event.item is None:
+            return
+        mailbox_id = event.item.name or ""
+        mailbox = next((item for item in self.module.mailboxes if item["id"] == mailbox_id), None)
+        if mailbox is None or mailbox_id == self.module.selected_mailbox_id:
+            return
+        self.module.set_mailbox(mailbox["id"], mailbox["name"])
+        self.app.update_status(f"Gmail mailbox: {mailbox['name']}")
+        self.action_refresh()
+
+    def current_record(self) -> Record | None:
+        if self.current_key is None:
+            return None
+        return self.records.get(self.current_key)
+
+
 class WorkspaceApp(App):
     """Unified Google Workspace TUI backed by gws."""
 
@@ -748,28 +966,29 @@ class WorkspaceApp(App):
         background: #1b1b1b;
     }
 
-    #module-bar {
-        height: auto;
-        margin-bottom: 0;
-        padding: 0;
+    #workspace {
+        height: 1fr;
+    }
+
+    #sidebar {
+        width: 18;
+        min-width: 18;
+        margin-right: 1;
+        padding: 1 0;
         background: #202020;
         border: round #3a3a3a;
     }
 
-    .module-tab {
-        width: auto;
-        min-width: 9;
-        margin-right: 0;
-        padding: 0;
-        background: #1b1b1b;
-        color: #bdbdbd;
-        border: round #343434;
+    .section-label {
+        color: #d0d0d0;
+        text-style: bold;
+        margin: 0 1 1 1;
     }
 
-    .module-tab.-active {
-        text-style: bold;
-        color: #f4f4f4;
-        background: #252525;
+    #module-list {
+        height: 1fr;
+        background: transparent;
+        border: tall #343434;
     }
 
     #content-switcher {
@@ -779,7 +998,7 @@ class WorkspaceApp(App):
 
     .module-frame {
         height: 1fr;
-        padding: 1;
+        padding: 1 0;
         background: #202020;
         border: round #3a3a3a;
     }
@@ -790,11 +1009,6 @@ class WorkspaceApp(App):
         margin-bottom: 0;
     }
 
-    .module-description {
-        color: #aaaaaa;
-        margin: 0 0 0 1;
-    }
-
     .module-body {
         height: 1fr;
     }
@@ -802,7 +1016,11 @@ class WorkspaceApp(App):
     .module-heading {
         height: auto;
         align: left middle;
-        margin-bottom: 1;
+        margin: 0 1;
+    }
+
+    #calendar-month-label {
+        margin: 0 1 1 1;
     }
 
     .module-badge {
@@ -827,6 +1045,20 @@ class WorkspaceApp(App):
     }
 
     .pane-detail {
+        width: 5fr;
+    }
+
+    .pane-mailboxes {
+        width: 3fr;
+        margin-right: 1;
+    }
+
+    .pane-mail {
+        width: 5fr;
+        margin-right: 1;
+    }
+
+    .pane-mail-detail {
         width: 5fr;
     }
 
@@ -871,30 +1103,12 @@ class WorkspaceApp(App):
         background: #1d262a;
     }
 
-    #module-tab-gmail.-active {
-        color: #88c0d0;
-        border: round #32464f;
-        background: #1d262a;
-    }
-
     #badge-calendar {
         border: round #44523a;
         background: #22271d;
     }
 
-    #module-tab-calendar.-active {
-        color: #a3be8c;
-        border: round #44523a;
-        background: #22271d;
-    }
-
     #badge-docs {
-        border: round #5b5131;
-        background: #29251b;
-    }
-
-    #module-tab-docs.-active {
-        color: #ebcb8b;
         border: round #5b5131;
         background: #29251b;
     }
@@ -936,6 +1150,12 @@ class WorkspaceApp(App):
 
     .detail-container {
         height: 1fr;
+    }
+
+    #mailbox-list-gmail {
+        height: 1fr;
+        background: transparent;
+        border: tall #343434;
     }
 
     ComposeEmailScreen, CreateEventScreen, ConfirmDeleteScreen, LabelEditorScreen, GmailSearchScreen, CreateDocumentScreen, EditDocumentScreen {
@@ -1037,19 +1257,33 @@ class WorkspaceApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Container(id="shell"):
-            with Horizontal(id="module-bar"):
-                for index, module in enumerate(self.modules, start=1):
-                    yield Button(f"{index}. {module.title}", id=f"module-tab-{module.id}", classes="module-tab")
-            with ContentSwitcher(initial=f"frame-{self.current_module_id}", id="content-switcher"):
-                for module in self.modules:
-                    view = CalendarGridView(module, self.client) if isinstance(module, CalendarModule) else ModuleView(module, self.client)
-                    self.module_views[module.id] = view
-                    with Container(id=f"frame-{module.id}", classes="module-frame"):
-                        yield view
+            with Horizontal(id="workspace"):
+                with ScrollableContainer(id="sidebar"):
+                    yield Static("Modules", classes="section-label")
+                    yield ListView(
+                        *(
+                            ListItem(Static(f"{index}. {module.title}"), name=module.id)
+                            for index, module in enumerate(self.modules, start=1)
+                        ),
+                        id="module-list",
+                    )
+                with ContentSwitcher(initial=f"frame-{self.current_module_id}", id="content-switcher"):
+                    for module in self.modules:
+                        if isinstance(module, CalendarModule):
+                            view = CalendarGridView(module, self.client)
+                        elif isinstance(module, GmailModule):
+                            view = GmailView(module, self.client)
+                        else:
+                            view = ModuleView(module, self.client)
+                        self.module_views[module.id] = view
+                        with Container(id=f"frame-{module.id}", classes="module-frame"):
+                            yield view
         yield Static("Ready", id="status")
         yield Footer()
 
     def on_mount(self) -> None:
+        module_list = self.query_one(ListView)
+        module_list.index = 0
         self._show_module(self.current_module_id)
 
     def on_key(self, event: Key) -> None:
@@ -1062,6 +1296,8 @@ class WorkspaceApp(App):
         index = int(event.character) - 1
         if not 0 <= index < len(self.modules):
             return
+        module_list = self.query_one(ListView)
+        module_list.index = index
         self._show_module(self.modules[index].id)
         event.stop()
 
@@ -1191,7 +1427,12 @@ class WorkspaceApp(App):
         self._load_label_editor(gmail_module, record.key, record.title, current_label_ids)
 
     def action_next_module(self) -> None:
-        next_index = (self._current_module_index() + 1) % len(self.modules)
+        module_list = self.query_one(ListView)
+        if module_list.index is None:
+            module_list.index = 0
+            return
+        next_index = (module_list.index + 1) % len(self.modules)
+        module_list.index = next_index
         self._show_module(self.modules[next_index].id)
 
     def action_previous_calendar_month(self) -> None:
@@ -1209,34 +1450,28 @@ class WorkspaceApp(App):
             view.action_next_month()
 
     def action_previous_module(self) -> None:
-        next_index = (self._current_module_index() - 1) % len(self.modules)
+        module_list = self.query_one(ListView)
+        if module_list.index is None:
+            module_list.index = 0
+            return
+        next_index = (module_list.index - 1) % len(self.modules)
+        module_list.index = next_index
         self._show_module(self.modules[next_index].id)
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        button_id = event.button.id or ""
-        if not button_id.startswith("module-tab-"):
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        if event.list_view.id != "module-list" or event.item is None:
             return
-        self._show_module(button_id.removeprefix("module-tab-"))
+        self._show_module(event.item.name or self.current_module_id)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.list_view.id != "module-list" or event.item is None:
+            return
+        self._show_module(event.item.name or self.current_module_id)
 
     def _show_module(self, module_id: str) -> None:
         self.current_module_id = module_id
         self.query_one(ContentSwitcher).current = f"frame-{module_id}"
-        self._sync_module_tabs()
         self.module_views[module_id].load_if_needed()
-
-    def _current_module_index(self) -> int:
-        for index, module in enumerate(self.modules):
-            if module.id == self.current_module_id:
-                return index
-        return 0
-
-    def _sync_module_tabs(self) -> None:
-        for module in self.modules:
-            button = self.query_one(f"#module-tab-{module.id}", Button)
-            if module.id == self.current_module_id:
-                button.add_class("-active")
-            else:
-                button.remove_class("-active")
 
     def _current_calendar_module(self) -> CalendarModule | None:
         for module in self.modules:

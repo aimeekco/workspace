@@ -295,13 +295,51 @@ class GmailHelpersTest(unittest.TestCase):
 
         self.assertEqual(client.calls[-1][3]["message"]["threadId"], "thread-1")
 
+    def test_mailbox_options_include_system_and_custom_labels(self) -> None:
+        client = StubClient()
+        module = GmailModule()
+        client.add(
+            ("gmail", "users", "labels", "list", "[('userId', 'me')]"),
+            {
+                "labels": [
+                    {"id": "INBOX", "name": "INBOX", "type": "SYSTEM"},
+                    {"id": "SENT", "name": "SENT", "type": "SYSTEM"},
+                    {"id": "TRASH", "name": "TRASH", "type": "SYSTEM"},
+                    {"id": "Label_1", "name": "Projects", "type": "USER"},
+                    {"id": "Label_2", "name": "Alpha", "type": "USER"},
+                ]
+            },
+        )
+
+        options = module.mailbox_options(client)  # type: ignore[arg-type]
+
+        self.assertEqual(
+            [option["name"] for option in options],
+            ["Inbox", "Sent", "Trash", "Alpha", "Projects"],
+        )
+        self.assertEqual(module.list_label(), "Inbox")
+
     def test_fetch_records_uses_search_query_and_unread_filter(self) -> None:
         client = StubClient()
         module = GmailModule()
         module.set_search_query("from:boss@example.com")
         module.toggle_unread_only()
         client.add(
-            ("gmail", "users", "messages", "list", "[('maxResults', 20), ('q', 'from:boss@example.com is:unread'), ('userId', 'me')]"),
+            ("gmail", "users", "labels", "list", "[('userId', 'me')]"),
+            {
+                "labels": [
+                    {"id": "INBOX", "name": "INBOX", "type": "SYSTEM"},
+                ]
+            },
+        )
+        client.add(
+            (
+                "gmail",
+                "users",
+                "messages",
+                "list",
+                "[('labelIds', 'INBOX'), ('maxResults', 20), ('q', 'from:boss@example.com is:unread'), ('userId', 'me')]",
+            ),
             {"messages": []},
         )
 
@@ -310,7 +348,32 @@ class GmailHelpersTest(unittest.TestCase):
         self.assertEqual(records, [])
         self.assertEqual(client.calls[-1][1], ("users", "messages", "list"))
         self.assertEqual(client.calls[-1][2]["q"], "from:boss@example.com is:unread")
-        self.assertEqual(module.subtitle(), 'Mailbox: query="from:boss@example.com", unread only')
+        self.assertEqual(client.calls[-1][2]["labelIds"], "INBOX")
+        self.assertEqual(module.subtitle(), 'Mailbox: inbox, query="from:boss@example.com", unread only')
+
+    def test_fetch_records_uses_selected_mailbox_label(self) -> None:
+        client = StubClient()
+        module = GmailModule()
+        client.add(
+            ("gmail", "users", "labels", "list", "[('userId', 'me')]"),
+            {
+                "labels": [
+                    {"id": "INBOX", "name": "INBOX", "type": "SYSTEM"},
+                    {"id": "SENT", "name": "SENT", "type": "SYSTEM"},
+                ]
+            },
+        )
+        module.set_mailbox("SENT", "Sent")
+        client.add(
+            ("gmail", "users", "messages", "list", "[('labelIds', 'SENT'), ('maxResults', 20), ('userId', 'me')]"),
+            {"messages": []},
+        )
+
+        records = module.fetch_records(client)  # type: ignore[arg-type]
+
+        self.assertEqual(records, [])
+        self.assertEqual(client.calls[-1][2]["labelIds"], "SENT")
+        self.assertEqual(module.list_label(), "Sent")
 
     def test_fetch_detail_reads_thread_messages(self) -> None:
         client = StubClient()

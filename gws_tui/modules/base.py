@@ -27,6 +27,9 @@ class WorkspaceModule(ABC):
     def empty_hint(self) -> str:
         return "Refresh to try again."
 
+    def list_label(self) -> str:
+        return "Results"
+
     @abstractmethod
     def fetch_records(self, client: GwsClient) -> list[Record]:
         raise NotImplementedError

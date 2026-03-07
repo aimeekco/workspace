@@ -104,12 +104,15 @@ class GmailModule(WorkspaceModule):
     id = "gmail"
     title = "Gmail"
     description = "Recent inbox messages."
-    columns = ("From", "Subject", "Date")
+    columns = ("Subject", "From", "Time")
     empty_message = "No inbox messages found."
 
     def __init__(self) -> None:
         self.search_query = ""
         self.unread_only = False
+        self.selected_mailbox_id = "INBOX"
+        self.selected_mailbox_name = "Inbox"
+        self.mailboxes: list[dict[str, str]] = []
 
     def subtitle(self) -> str:
         if not self.search_query and not self.unread_only:
@@ -125,22 +128,76 @@ class GmailModule(WorkspaceModule):
     def empty_hint(self) -> str:
         return "Use / to search, u for unread only, or r to refresh."
 
+    def list_label(self) -> str:
+        return self.selected_mailbox_name
+
+    def mailbox_options(self, client: GwsClient) -> list[dict[str, str]]:
+        response = client.run(
+            "gmail",
+            "users",
+            "labels",
+            "list",
+            params={"userId": "me"},
+        )
+        labels = response.get("labels", [])
+        label_map = {label.get("id", ""): label for label in labels}
+        preferred = [
+            ("INBOX", "Inbox"),
+            ("SENT", "Sent"),
+            ("DRAFT", "Drafts"),
+            ("STARRED", "Starred"),
+            ("IMPORTANT", "Important"),
+            ("TRASH", "Trash"),
+        ]
+        options: list[dict[str, str]] = []
+        for label_id, fallback_name in preferred:
+            label = label_map.get(label_id)
+            if label is None:
+                continue
+            options.append(
+                {
+                    "id": label_id,
+                    "name": label.get("name", fallback_name).title(),
+                    "type": "SYSTEM",
+                }
+            )
+        user_labels = sorted(
+            [label for label in labels if label.get("type") == "USER"],
+            key=lambda label: label.get("name", "").lower(),
+        )
+        for label in user_labels:
+            options.append(
+                {
+                    "id": label.get("id", ""),
+                    "name": label.get("name", "Unnamed label"),
+                    "type": "USER",
+                }
+            )
+        self.mailboxes = [option for option in options if option["id"]]
+        if not any(option["id"] == self.selected_mailbox_id for option in self.mailboxes):
+            self.selected_mailbox_id = "INBOX"
+            self.selected_mailbox_name = "Inbox"
+        else:
+            current = next(option for option in self.mailboxes if option["id"] == self.selected_mailbox_id)
+            self.selected_mailbox_name = current["name"]
+        return self.mailboxes
+
+    def set_mailbox(self, mailbox_id: str, mailbox_name: str) -> None:
+        self.selected_mailbox_id = mailbox_id
+        self.selected_mailbox_name = mailbox_name
+
     def scope_query(self) -> str:
         terms: list[str] = []
         if self.search_query:
             terms.append(self.search_query)
-        else:
-            terms.append("in:inbox")
         if self.unread_only:
             terms.append("is:unread")
         return " ".join(term for term in terms if term)
 
     def scope_summary(self) -> str:
-        parts: list[str] = []
+        parts = [self.selected_mailbox_name.lower()]
         if self.search_query:
             parts.append(f'query="{self.search_query}"')
-        else:
-            parts.append("inbox")
         if self.unread_only:
             parts.append("unread only")
         return ", ".join(parts)
@@ -212,18 +269,23 @@ class GmailModule(WorkspaceModule):
             )
 
     def fetch_records(self, client: GwsClient) -> list[Record]:
+        self.mailbox_options(client)
         query = self.scope_query()
         self.empty_message = f"No Gmail messages found for {self.scope_summary()}."
+        params: dict[str, Any] = {
+            "userId": "me",
+            "maxResults": 20,
+        }
+        if query:
+            params["q"] = query
+        if self.selected_mailbox_id:
+            params["labelIds"] = self.selected_mailbox_id
         response = client.run(
             "gmail",
             "users",
             "messages",
             "list",
-            params={
-                "userId": "me",
-                "maxResults": 20,
-                "q": query,
-            },
+            params=params,
         )
         message_ids = [message["id"] for message in response.get("messages", [])]
         if not message_ids:
@@ -250,7 +312,7 @@ class GmailModule(WorkspaceModule):
             records.append(
                 Record(
                     key=message_id,
-                    columns=(sender, subject, date),
+                    columns=(subject, sender, date),
                     title=subject,
                     subtitle=sender,
                     preview=preview,
@@ -258,6 +320,7 @@ class GmailModule(WorkspaceModule):
                         "headers": headers,
                         "label_ids": metadata.get("labelIds", []),
                         "thread_id": metadata.get("threadId"),
+                        "mailbox_id": self.selected_mailbox_id,
                     },
                 )
             )
