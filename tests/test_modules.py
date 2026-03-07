@@ -8,6 +8,7 @@ from datetime import timezone
 
 from gws_tui.models import Record
 from gws_tui.modules.calendar import CalendarModule, event_day_keys, format_event_time
+from gws_tui.modules.drive import DriveModule, drive_kind
 from gws_tui.modules.docs import DocsModule, document_body_end_index, extract_document_text
 from gws_tui.modules.gmail import GmailModule, extract_body, format_message_date, normalize_forward_subject, normalize_reply_subject
 
@@ -674,6 +675,124 @@ class DocsModuleTest(unittest.TestCase):
         requests = client.calls[-1][3]["requests"]
         self.assertEqual(requests[0]["deleteContentRange"]["range"], {"startIndex": 1, "endIndex": 14})
         self.assertEqual(requests[1]["insertText"]["text"], "Updated text")
+
+
+class DriveModuleTest(unittest.TestCase):
+    def test_drive_kind_maps_common_mime_types(self) -> None:
+        self.assertEqual(drive_kind({"mimeType": "application/vnd.google-apps.folder"}), "Folder")
+        self.assertEqual(drive_kind({"mimeType": "application/vnd.google-apps.document"}), "Doc")
+        self.assertEqual(drive_kind({"mimeType": "application/pdf"}), "PDF")
+
+    def test_fetch_records_lists_my_drive_root_files(self) -> None:
+        client = StubClient()
+        module = DriveModule()
+        client.add(
+            (
+                "drive",
+                "files",
+                "list",
+                "[('includeItemsFromAllDrives', True), ('orderBy', 'modifiedTime desc'), ('pageSize', 25), ('q', \"'root' in parents and trashed=false\"), ('supportsAllDrives', True)]",
+            ),
+            [
+                {
+                    "files": [
+                        {
+                            "id": "file-1",
+                            "name": "Quarterly Plan",
+                            "mimeType": "application/vnd.google-apps.document",
+                            "modifiedTime": "2026-03-07T18:00:00Z",
+                            "owners": [{"displayName": "Aimee"}],
+                            "webViewLink": "https://drive.google.com/file/d/file-1/view",
+                        }
+                    ]
+                }
+            ],
+        )
+
+        records = module.fetch_records(client)  # type: ignore[arg-type]
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].columns[0], "Quarterly Plan")
+        self.assertEqual(records[0].columns[1], "Doc")
+        self.assertEqual(records[0].subtitle, "Doc")
+        self.assertEqual(module.list_label(), "My Drive")
+
+    def test_fetch_detail_reads_drive_file_metadata(self) -> None:
+        client = StubClient()
+        module = DriveModule()
+        client.add(
+            ("drive", "files", "get", "[('fileId', 'file-1'), ('supportsAllDrives', True)]"),
+            {
+                "id": "file-1",
+                "name": "Quarterly Plan",
+                "mimeType": "application/pdf",
+                "modifiedTime": "2026-03-07T18:00:00Z",
+                "owners": [{"displayName": "Aimee"}],
+                "webViewLink": "https://drive.google.com/file/d/file-1/view",
+                "size": "2048",
+                "parents": ["folder-1"],
+            },
+        )
+
+        record = Record(
+            key="file-1",
+            columns=("Quarterly Plan", "PDF", "Mar 07 10:00 AM"),
+            title="Quarterly Plan",
+            subtitle="PDF",
+            raw={},
+        )
+
+        detail = module.fetch_detail(client, record)
+
+        self.assertIn("Drive File Overview", detail)
+        self.assertIn("Name: Quarterly Plan", detail)
+        self.assertIn("Kind: PDF", detail)
+        self.assertIn("Size: 2048 bytes", detail)
+        self.assertIn("Parents: folder-1", detail)
+
+    def test_fetch_records_in_folder_uses_folder_id_and_parent_row(self) -> None:
+        client = StubClient()
+        module = DriveModule()
+        module.enter_folder(
+            Record(
+                key="folder-1",
+                columns=("Projects", "Folder", "Mar 07 10:00 AM"),
+                title="Projects",
+                subtitle="Folder",
+                raw={"mimeType": "application/vnd.google-apps.folder"},
+            )
+        )
+        client.add(
+            (
+                "drive",
+                "files",
+                "list",
+                "[('includeItemsFromAllDrives', True), ('orderBy', 'modifiedTime desc'), ('pageSize', 25), ('q', \"'folder-1' in parents and trashed=false\"), ('supportsAllDrives', True)]",
+            ),
+            [{"files": []}],
+        )
+
+        records = module.fetch_records(client)  # type: ignore[arg-type]
+
+        self.assertEqual(len(records), 1)
+        self.assertTrue(records[0].raw["navigate_up"])
+        self.assertEqual(module.list_label(), "Projects")
+
+    def test_navigate_up_restores_previous_folder(self) -> None:
+        module = DriveModule()
+        module.enter_folder(
+            Record(
+                key="folder-1",
+                columns=("Projects", "Folder", "Mar 07 10:00 AM"),
+                title="Projects",
+                subtitle="Folder",
+                raw={},
+            )
+        )
+        module.navigate_up()
+
+        self.assertEqual(module.current_folder_id, "root")
+        self.assertEqual(module.list_label(), "My Drive")
 
 
 if __name__ == "__main__":

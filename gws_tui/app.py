@@ -17,6 +17,7 @@ from gws_tui.client import GwsClient, GwsError
 from gws_tui.models import Record
 from gws_tui.modules import WorkspaceModule, built_in_modules
 from gws_tui.modules.calendar import CalendarModule
+from gws_tui.modules.drive import DriveModule
 from gws_tui.modules.docs import DocsModule
 from gws_tui.modules.gmail import GmailModule
 
@@ -566,7 +567,7 @@ class ModuleView(ScrollableContainer):
             yield Static(self.module.badge(), id=f"badge-{self.module.id}", classes="module-badge")
         with Horizontal(classes="module-body"):
             with Container(classes="pane pane-table"):
-                yield Static(self.module.list_label(), classes="pane-title")
+                yield Static(self.module.list_label(), id=f"list-label-{self.module.id}", classes="pane-title")
                 yield DataTable(id=f"table-{self.module.id}")
             with Container(classes="pane pane-detail"):
                 yield Static("Preview", id=f"detail-label-{self.module.id}", classes="pane-title")
@@ -590,10 +591,14 @@ class ModuleView(ScrollableContainer):
     def action_refresh(self) -> None:
         self.loaded = True
         self.detail_cache.clear()
+        self._refresh_list_label()
         self._set_detail_label("Preview")
         self._set_detail_text(self._state_text(f"Loading {self.module.title}", self.module.loading_message()))
         self.app.update_status(f"Loading {self.module.title.lower()}...")
         self._load_records()
+
+    def _refresh_list_label(self) -> None:
+        self.query_one(f"#list-label-{self.module.id}", Static).update(self.module.list_label())
 
     def show_preview(self, key: str) -> None:
         if key not in self.records:
@@ -649,6 +654,7 @@ class ModuleView(ScrollableContainer):
         self.records = {record.key: record for record in records}
         table = self.query_one(DataTable)
         table.clear()
+        self._refresh_list_label()
         if not records:
             self.current_key = None
             self._set_detail_label("Preview")
@@ -941,6 +947,33 @@ class GmailView(ScrollableContainer):
         return self.records.get(self.current_key)
 
 
+class DriveView(ModuleView):
+    """Drive-specific list/detail view with folder navigation."""
+
+    module: DriveModule
+
+    def __init__(self, module: DriveModule, client: GwsClient) -> None:
+        super().__init__(module, client)
+
+    def open_record(self, key: str) -> None:
+        record = self.records.get(key)
+        if record is None:
+            return
+        if record.raw.get("navigate_up"):
+            self.module.navigate_up()
+            self.current_key = None
+            self.app.update_status(f"Drive: {self.module.list_label()}")
+            self.action_refresh()
+            return
+        if record.subtitle == "Folder":
+            self.module.enter_folder(record)
+            self.current_key = None
+            self.app.update_status(f"Drive: {self.module.list_label()}")
+            self.action_refresh()
+            return
+        super().open_record(key)
+
+
 class Workspace(App):
     """Unified Google Workspace TUI backed by gws."""
 
@@ -1077,6 +1110,10 @@ class Workspace(App):
         border: round #44523a;
     }
 
+    #frame-drive {
+        border: round #4b4636;
+    }
+
     #frame-docs {
         border: round #5b5131;
     }
@@ -1091,6 +1128,12 @@ class Workspace(App):
     #frame-calendar .pane-title,
     #badge-calendar {
         color: #a3be8c;
+    }
+
+    #title-drive,
+    #frame-drive .pane-title,
+    #badge-drive {
+        color: #d8b56c;
     }
 
     #title-docs,
@@ -1259,6 +1302,8 @@ class Workspace(App):
                             view = CalendarGridView(module, self.client)
                         elif isinstance(module, GmailModule):
                             view = GmailView(module, self.client)
+                        elif isinstance(module, DriveModule):
+                            view = DriveView(module, self.client)
                         else:
                             view = ModuleView(module, self.client)
                         self.module_views[module.id] = view
