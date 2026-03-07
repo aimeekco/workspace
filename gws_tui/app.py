@@ -364,7 +364,14 @@ class EditDocumentScreen(ModalScreen[dict[str, str] | None]):
 class EditSheetScreen(ModalScreen[dict[str, str] | None]):
     """Edit Google Sheets cell data as aligned columns."""
 
-    BINDINGS = [("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+        ("ctrl+s", "save", "Save"),
+        ("ctrl+o", "insert_row_below", "Row Below"),
+        ("ctrl+shift+o", "insert_row_above", "Row Above"),
+        ("ctrl+d", "delete_row", "Delete Row"),
+        ("ctrl+g", "jump_bottom", "Bottom"),
+    ]
 
     def __init__(self, title: str, sheet_title: str, body: str) -> None:
         super().__init__()
@@ -376,7 +383,11 @@ class EditSheetScreen(ModalScreen[dict[str, str] | None]):
         with Container(id="sheet-edit-modal", classes="modal-window"):
             yield Static("Edit Google Sheet", classes="modal-title")
             yield Static(f"{self.title} · {self.sheet_title}", classes="modal-subtitle")
-            yield Static("Edit rows as aligned columns. Keep `|` between cells; long rows scroll horizontally.", classes="modal-subtitle")
+            yield Static(
+                "Ctrl+S save, Ctrl+O below, Ctrl+Shift+O above, Ctrl+D delete row, Ctrl+G bottom.",
+                classes="modal-subtitle",
+            )
+            yield Static("Keep `|` between cells; long rows scroll horizontally.", classes="modal-subtitle")
             yield TextArea(self.body, id="sheet-edit-body", soft_wrap=False)
             with Horizontal(classes="modal-actions"):
                 yield Button("Cancel", id="sheet-edit-cancel")
@@ -388,14 +399,68 @@ class EditSheetScreen(ModalScreen[dict[str, str] | None]):
     def action_cancel(self) -> None:
         self.dismiss(None)
 
+    def action_save(self) -> None:
+        body = self.query_one("#sheet-edit-body", TextArea).text
+        self.dismiss({"body": body})
+
+    def action_insert_row_below(self) -> None:
+        self._insert_row(offset=1)
+
+    def action_insert_row_above(self) -> None:
+        self._insert_row(offset=0)
+
+    def action_delete_row(self) -> None:
+        area = self.query_one("#sheet-edit-body", TextArea)
+        lines = self._editor_lines(area)
+        row, column = area.cursor_location
+        row = max(0, min(row, len(lines) - 1))
+        if len(lines) == 1:
+            lines = [self._blank_row_template(lines[0])]
+            next_row = 0
+        else:
+            del lines[row]
+            next_row = min(row, len(lines) - 1)
+        self._replace_editor_text(area, lines, next_row, column)
+
+    def action_jump_bottom(self) -> None:
+        area = self.query_one("#sheet-edit-body", TextArea)
+        lines = self._editor_lines(area)
+        target_row = max(0, len(lines) - 1)
+        target_column = min(area.cursor_location[1], len(lines[target_row]))
+        area.move_cursor((target_row, target_column))
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "sheet-edit-cancel":
             self.dismiss(None)
             return
         if event.button.id != "sheet-edit-submit":
             return
-        body = self.query_one("#sheet-edit-body", TextArea).text
-        self.dismiss({"body": body})
+        self.action_save()
+
+    def _insert_row(self, offset: int) -> None:
+        area = self.query_one("#sheet-edit-body", TextArea)
+        lines = self._editor_lines(area)
+        row, column = area.cursor_location
+        row = max(0, min(row, len(lines) - 1))
+        insert_at = row + offset
+        template_source = lines[row] if lines else ""
+        lines.insert(insert_at, self._blank_row_template(template_source))
+        self._replace_editor_text(area, lines, insert_at, column)
+
+    def _editor_lines(self, area: TextArea) -> list[str]:
+        return area.text.split("\n") or [""]
+
+    def _blank_row_template(self, source_line: str) -> str:
+        if " | " not in source_line:
+            return ""
+        return " | ".join(" " * max(1, len(segment)) for segment in source_line.split(" | "))
+
+    def _replace_editor_text(self, area: TextArea, lines: list[str], row: int, column: int) -> None:
+        area.load_text("\n".join(lines))
+        target_row = max(0, min(row, len(lines) - 1))
+        target_column = min(column, len(lines[target_row]))
+        area.move_cursor((target_row, target_column))
+        area.focus()
 
 
 class CalendarGridView(PassiveScrollableContainer):
