@@ -131,19 +131,29 @@ class CreateEventScreen(ModalScreen[dict[str, str] | None]):
 
     BINDINGS = [("escape", "cancel", "Cancel")]
 
-    def __init__(self, calendar_id: str) -> None:
+    def __init__(
+        self,
+        calendar_id: str,
+        initial_start: str = "",
+        initial_end: str = "",
+        initial_duration: str = "60",
+    ) -> None:
         super().__init__()
         self.calendar_id = calendar_id
+        self.initial_start = initial_start
+        self.initial_end = initial_end
+        self.initial_duration = initial_duration
 
     def compose(self) -> ComposeResult:
         with Container(id="event-modal", classes="modal-window"):
             yield Static("Create Calendar Event", classes="modal-title")
-            yield Static("Times use local format: YYYY-MM-DD HH:MM", classes="modal-subtitle")
+            yield Static("Use local 24-hour time: YYYY-MM-DD HH:MM. End is optional if duration is set.", classes="modal-subtitle")
             yield Input(value=self.calendar_id, placeholder="primary", id="event-calendar")
             yield Input(placeholder="Title", id="event-summary")
             with Horizontal(classes="modal-row"):
-                yield Input(placeholder="2026-03-06 09:00", id="event-start")
-                yield Input(placeholder="2026-03-06 10:00", id="event-end")
+                yield Input(value=self.initial_start, placeholder="2026-03-06 09:00", id="event-start")
+                yield Input(value=self.initial_end, placeholder="2026-03-06 10:00", id="event-end")
+            yield Input(value=self.initial_duration, placeholder="60 or 1h30m", id="event-duration")
             yield Input(placeholder="Location", id="event-location")
             yield TextArea("", id="event-description")
             with Horizontal(classes="modal-actions"):
@@ -167,6 +177,7 @@ class CreateEventScreen(ModalScreen[dict[str, str] | None]):
             "summary": self.query_one("#event-summary", Input).value.strip(),
             "start": self.query_one("#event-start", Input).value.strip(),
             "end": self.query_one("#event-end", Input).value.strip(),
+            "duration": self.query_one("#event-duration", Input).value.strip(),
             "location": self.query_one("#event-location", Input).value.strip(),
             "description": self.query_one("#event-description", TextArea).text.strip(),
         }
@@ -178,11 +189,77 @@ class CreateEventScreen(ModalScreen[dict[str, str] | None]):
             self.app.update_status("Event: start time is required")
             self.query_one("#event-start", Input).focus()
             return
-        if not values["end"]:
-            self.app.update_status("Event: end time is required")
-            self.query_one("#event-end", Input).focus()
+        if not values["end"] and not values["duration"]:
+            self.app.update_status("Event: set an end time or duration")
+            self.query_one("#event-duration", Input).focus()
             return
         self.dismiss(values)
+
+
+class DeleteCalendarEventScreen(ModalScreen[str | None]):
+    """Choose a calendar event from the selected day to delete."""
+
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+        ("enter", "delete_selected", "Delete"),
+    ]
+
+    def __init__(self, day_label: str, records: list[Record]) -> None:
+        super().__init__()
+        self.day_label = day_label
+        self.records = records
+
+    def compose(self) -> ComposeResult:
+        with Container(id="calendar-delete-modal", classes="modal-window"):
+            yield Static("Delete Calendar Event", classes="modal-title")
+            yield Static(self.day_label, classes="modal-subtitle")
+            yield Static("Use Up/Down to choose an event. Enter deletes it. Tab moves to the buttons.", classes="modal-subtitle")
+            yield ListView(
+                *(
+                    ListItem(
+                        Static(f"{record.columns[0]}  {record.title}"),
+                        name=record.key,
+                    )
+                    for record in self.records
+                ),
+                id="calendar-delete-list",
+            )
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel", id="calendar-delete-cancel")
+                yield Button("Delete", variant="warning", id="calendar-delete-submit")
+
+    def on_mount(self) -> None:
+        event_list = self.query_one("#calendar-delete-list", ListView)
+        event_list.index = 0
+        event_list.focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_delete_selected(self) -> None:
+        selected = self._selected_key()
+        if selected is None:
+            self.dismiss(None)
+            return
+        self.dismiss(selected)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "calendar-delete-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id == "calendar-delete-submit":
+            self.action_delete_selected()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.list_view.id != "calendar-delete-list":
+            return
+        self.action_delete_selected()
+
+    def _selected_key(self) -> str | None:
+        event_list = self.query_one("#calendar-delete-list", ListView)
+        if event_list.index is None or not self.records:
+            return None
+        return self.records[event_list.index].key
 
 
 class ConfirmDeleteScreen(ModalScreen[bool]):
@@ -660,6 +737,16 @@ class CalendarGridView(PassiveScrollableContainer):
             return None
         records = self.day_records.get(selected_day.isoformat(), [])
         return records[0] if records else None
+
+    def selected_day(self) -> date | None:
+        table = self.query_one("#calendar-grid", DataTable)
+        return self.coordinate_day.get((table.cursor_coordinate.row, table.cursor_coordinate.column))
+
+    def selected_day_records(self) -> list[Record]:
+        selected_day = self.selected_day()
+        if selected_day is None:
+            return []
+        return list(self.day_records.get(selected_day.isoformat(), []))
 
 
 class ModuleView(PassiveScrollableContainer):
@@ -1321,7 +1408,7 @@ class Workspace(App):
         border: tall #343434;
     }
 
-    ComposeEmailScreen, CreateEventScreen, ConfirmDeleteScreen, LabelEditorScreen, GmailSearchScreen, CreateDocumentScreen, EditDocumentScreen, EditSheetScreen {
+    ComposeEmailScreen, CreateEventScreen, ConfirmDeleteScreen, DeleteCalendarEventScreen, LabelEditorScreen, GmailSearchScreen, CreateDocumentScreen, EditDocumentScreen, EditSheetScreen {
         align: center middle;
     }
 
@@ -1384,6 +1471,13 @@ class Workspace(App):
         border: tall #343434;
         padding: 1;
         margin-bottom: 1;
+    }
+
+    #calendar-delete-list {
+        height: 12;
+        border: tall #343434;
+        margin-bottom: 1;
+        background: transparent;
     }
 
     #labels-empty {
@@ -1530,10 +1624,22 @@ class Workspace(App):
             self.update_status("Add event is only available in Calendar")
             return
         default_calendar_id = "primary"
+        initial_start = ""
+        initial_end = ""
+        initial_duration = "60"
         record = self.module_views[self.current_module_id].current_record()
-        if record is not None and "calendar_id" in record.raw:
+        if record is not None and record.raw.get("calendar_writable") and "calendar_id" in record.raw:
             default_calendar_id = record.raw["calendar_id"]
-        self.push_screen(CreateEventScreen(default_calendar_id), self._handle_event_result)
+        calendar_view = self.module_views.get("calendar")
+        if isinstance(calendar_view, CalendarGridView):
+            selected_day = calendar_view.selected_day()
+            if selected_day is not None:
+                day_text = selected_day.isoformat()
+                initial_start = f"{day_text} 09:00"
+        self.push_screen(
+            CreateEventScreen(default_calendar_id, initial_start, initial_end, initial_duration),
+            self._handle_event_result,
+        )
 
     def action_compose_email(self) -> None:
         gmail_module = self._current_gmail_module()
@@ -1629,9 +1735,28 @@ class Workspace(App):
         self.update_status("Edit is only available in Docs and Sheets")
 
     def action_delete_email(self) -> None:
+        if self.current_module_id == "calendar":
+            calendar_module = self._current_calendar_module()
+            calendar_view = self.module_views.get("calendar")
+            if calendar_module is None or not isinstance(calendar_view, CalendarGridView):
+                self.update_status("Delete is only available in Gmail and Calendar")
+                return
+            selected_day = calendar_view.selected_day()
+            records = [record for record in calendar_view.selected_day_records() if record.raw.get("calendar_writable")]
+            if selected_day is None:
+                self.update_status("Delete event: select a day in the current month")
+                return
+            if not records:
+                self.update_status("Delete event: no writable events on this day")
+                return
+            self.push_screen(
+                DeleteCalendarEventScreen(selected_day.strftime("%A, %B %d"), records),
+                lambda key: self._handle_calendar_delete_result(key, {record.key: record for record in records}),
+            )
+            return
         gmail_module = self._current_gmail_module()
         if gmail_module is None:
-            self.update_status("Trash is only available in Gmail")
+            self.update_status("Delete is only available in Gmail and Calendar")
             return
         record = self.module_views[self.current_module_id].current_record()
         if record is None:
@@ -1738,9 +1863,22 @@ class Workspace(App):
             result["summary"],
             result["start"],
             result["end"],
+            result["duration"],
             result["location"],
             result["description"],
         )
+
+    def _handle_calendar_delete_result(self, event_key: str | None, records: dict[str, Record]) -> None:
+        if event_key is None:
+            self.update_status("Delete event cancelled")
+            return
+        calendar_module = self._current_calendar_module()
+        record = records.get(event_key)
+        if calendar_module is None or record is None:
+            self.update_status("Delete event is only available in Calendar")
+            return
+        self.update_status("Deleting calendar event...")
+        self._delete_calendar_event(calendar_module, record)
 
     def _handle_compose_result(self, result: dict[str, str] | None) -> None:
         if result is None:
@@ -1906,6 +2044,7 @@ class Workspace(App):
         summary: str,
         start_text: str,
         end_text: str,
+        duration_text: str,
         location: str,
         description: str,
     ) -> None:
@@ -1916,6 +2055,7 @@ class Workspace(App):
                 summary=summary,
                 start_text=start_text,
                 end_text=end_text,
+                duration_text=duration_text,
                 location=location,
                 description=description,
             )
@@ -1929,6 +2069,23 @@ class Workspace(App):
             self.call_from_thread(self.update_status, f"Event failed: {exc}")
             return
         self.call_from_thread(self.update_status, "Calendar event created")
+        self.call_from_thread(self.module_views["calendar"].action_refresh)
+
+    @work(thread=True, exclusive=True)
+    def _delete_calendar_event(self, calendar_module: CalendarModule, record: Record) -> None:
+        try:
+            calendar_module.delete_event(
+                self.client,
+                calendar_id=record.raw["calendar_id"],
+                event_id=record.raw["event"]["id"],
+            )
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Delete event failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Delete event failed: {exc}")
+            return
+        self.call_from_thread(self.update_status, "Calendar event deleted")
         self.call_from_thread(self.module_views["calendar"].action_refresh)
 
     @work(thread=True, exclusive=True)

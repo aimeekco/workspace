@@ -7,7 +7,7 @@ import unittest
 from datetime import timezone
 
 from gws_tui.models import Record
-from gws_tui.modules.calendar import CalendarModule, event_day_keys, format_event_time
+from gws_tui.modules.calendar import CalendarModule, calendar_is_writable, event_day_keys, format_event_time, parse_duration
 from gws_tui.modules.drive import DriveModule, drive_kind
 from gws_tui.modules.docs import DocsModule, document_body_end_index, extract_document_text
 from gws_tui.modules.gmail import GmailModule, extract_body, format_message_date, normalize_forward_subject, normalize_reply_subject
@@ -35,6 +35,16 @@ class StubClient:
 
 
 class CalendarModuleTest(unittest.TestCase):
+    def test_calendar_is_writable_prefers_primary_and_write_roles(self) -> None:
+        self.assertTrue(calendar_is_writable({"primary": True, "accessRole": "reader"}))
+        self.assertTrue(calendar_is_writable({"accessRole": "writer"}))
+        self.assertTrue(calendar_is_writable({"accessRole": "owner"}))
+        self.assertFalse(calendar_is_writable({"accessRole": "reader"}))
+
+    def test_parse_duration_supports_minutes_and_hour_minute_text(self) -> None:
+        self.assertEqual(parse_duration("60").total_seconds(), 3600)
+        self.assertEqual(parse_duration("1h30m").total_seconds(), 5400)
+
     def test_fetch_records_merges_upcoming_events(self) -> None:
         client = StubClient()
         module = CalendarModule()
@@ -98,6 +108,8 @@ class CalendarModuleTest(unittest.TestCase):
         self.assertEqual(records[0].title, "Standup")
         self.assertEqual(records[1].subtitle, "Team")
         self.assertEqual(records[0].raw["day_keys"], ["2026-03-07"])
+        self.assertTrue(records[0].raw["calendar_writable"])
+        self.assertFalse(records[1].raw["calendar_writable"])
 
     def test_format_event_time_handles_all_day_events(self) -> None:
         self.assertEqual(format_event_time({"start": {"date": "2026-03-09"}}), "2026-03-09 all day")
@@ -118,6 +130,20 @@ class CalendarModuleTest(unittest.TestCase):
         self.assertEqual(body["description"], "Agenda")
         self.assertIn("T09:00:00", body["start"]["dateTime"])
         self.assertIn("T10:00:00", body["end"]["dateTime"])
+
+    def test_build_event_body_supports_duration_without_end_time(self) -> None:
+        module = CalendarModule()
+
+        body = module.build_event_body(
+            summary="Planning",
+            start_text="2026-03-09 09:00",
+            duration_text="90",
+            location="Room 1",
+            description="Agenda",
+        )
+
+        self.assertIn("T09:00:00", body["start"]["dateTime"])
+        self.assertIn("T10:30:00", body["end"]["dateTime"])
 
     def test_add_event_uses_insert_endpoint(self) -> None:
         client = StubClient()
@@ -141,6 +167,19 @@ class CalendarModuleTest(unittest.TestCase):
         self.assertEqual(client.calls[-1][1], ("events", "insert"))
         self.assertEqual(client.calls[-1][2], {"calendarId": "primary", "sendUpdates": "none"})
         self.assertEqual(client.calls[-1][3]["summary"], "Planning")
+
+    def test_delete_event_uses_delete_endpoint(self) -> None:
+        client = StubClient()
+        module = CalendarModule()
+        client.add(
+            ("calendar", "events", "delete", "[('calendarId', 'primary'), ('eventId', 'evt-1'), ('sendUpdates', 'none')]"),
+            {},
+        )
+
+        module.delete_event(client, "primary", "evt-1")  # type: ignore[arg-type]
+
+        self.assertEqual(client.calls[-1][1], ("events", "delete"))
+        self.assertEqual(client.calls[-1][2], {"calendarId": "primary", "eventId": "evt-1", "sendUpdates": "none"})
 
     def test_event_day_keys_spans_multi_day_all_day_event(self) -> None:
         keys = event_day_keys(

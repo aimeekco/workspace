@@ -36,6 +36,23 @@ def parse_local_datetime(value: str) -> datetime:
     raise ValueError("Use YYYY-MM-DD HH:MM")
 
 
+def parse_duration(value: str) -> timedelta:
+    normalized = value.strip().lower()
+    if not normalized:
+        raise ValueError("Duration is required when end time is blank")
+    if normalized.isdigit():
+        return timedelta(minutes=int(normalized))
+    match = re.fullmatch(r"(?:(\d+)h)?\s*(?:(\d+)m)?", normalized)
+    if not match:
+        raise ValueError("Use minutes like 60 or durations like 1h30m")
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    total_minutes = hours * 60 + minutes
+    if total_minutes <= 0:
+        raise ValueError("Duration must be greater than zero")
+    return timedelta(minutes=total_minutes)
+
+
 def format_event_time(event: dict) -> str:
     start = event.get("start", {})
     if "dateTime" in start:
@@ -95,6 +112,12 @@ def event_day_keys(event: dict) -> list[str]:
     return keys
 
 
+def calendar_is_writable(calendar: dict[str, Any]) -> bool:
+    if calendar.get("primary"):
+        return True
+    return calendar.get("accessRole") in {"owner", "writer"}
+
+
 class CalendarModule(WorkspaceModule):
     id = "calendar"
     title = "Calendar"
@@ -115,12 +138,16 @@ class CalendarModule(WorkspaceModule):
         self,
         summary: str,
         start_text: str,
-        end_text: str,
+        end_text: str = "",
+        duration_text: str = "",
         location: str = "",
         description: str = "",
     ) -> dict:
         start = parse_local_datetime(start_text)
-        end = parse_local_datetime(end_text)
+        if end_text.strip():
+            end = parse_local_datetime(end_text)
+        else:
+            end = start + parse_duration(duration_text)
         if end <= start:
             raise ValueError("End must be after start")
 
@@ -141,7 +168,8 @@ class CalendarModule(WorkspaceModule):
         calendar_id: str,
         summary: str,
         start_text: str,
-        end_text: str,
+        end_text: str = "",
+        duration_text: str = "",
         location: str = "",
         description: str = "",
     ) -> dict:
@@ -154,9 +182,22 @@ class CalendarModule(WorkspaceModule):
                 summary=summary,
                 start_text=start_text,
                 end_text=end_text,
+                duration_text=duration_text,
                 location=location,
                 description=description,
             ),
+        )
+
+    def delete_event(self, client: GwsClient, calendar_id: str, event_id: str) -> dict:
+        return client.run(
+            "calendar",
+            "events",
+            "delete",
+            params={
+                "calendarId": calendar_id,
+                "eventId": event_id,
+                "sendUpdates": "none",
+            },
         )
 
     def fetch_records(self, client: GwsClient) -> list[Record]:
@@ -210,6 +251,7 @@ class CalendarModule(WorkspaceModule):
     ) -> list[Record]:
         calendar_id = calendar["id"]
         calendar_name = calendar.get("summaryOverride") or calendar.get("summary") or calendar_id
+        calendar_writable = calendar_is_writable(calendar)
         events_response = client.run(
             "calendar",
             "events",
@@ -256,6 +298,7 @@ class CalendarModule(WorkspaceModule):
                         "day_keys": event_day_keys(event),
                         "calendar_id": calendar_id,
                         "calendar_name": calendar_name,
+                        "calendar_writable": calendar_writable,
                         "event": event,
                     },
                 )
