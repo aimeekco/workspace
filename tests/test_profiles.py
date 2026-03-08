@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from gws_tui.profiles import GwsProfile, discover_profiles, inspect_profile
+from gws_tui.profiles import GwsProfile, discover_profiles, inspect_profile, inspect_profile_local
 
 
 class ProfilesTest(unittest.TestCase):
@@ -91,6 +91,32 @@ class ProfilesTest(unittest.TestCase):
         self.assertEqual(diagnostic.status, "Needs OAuth client")
         self.assertFalse(diagnostic.client_config_exists)
         self.assertIn("No OAuth client configured.", diagnostic.detail)
+
+    def test_inspect_profile_local_marks_saved_credentials_as_checking(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_dir = Path(temp_dir)
+            (config_dir / "client_secret.json").write_text("{}")
+            (config_dir / "credentials.enc").write_text("encrypted")
+            profile = GwsProfile(name="personal", config_dir=str(config_dir))
+
+            diagnostic = inspect_profile_local(profile)
+
+        self.assertEqual(diagnostic.status, "Checking...")
+        self.assertTrue(diagnostic.client_config_exists)
+        self.assertTrue(diagnostic.encrypted_credentials_exists)
+        self.assertIn("running live auth check", diagnostic.detail.lower())
+
+    def test_inspect_profile_local_marks_missing_saved_credentials_as_login_required(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_dir = Path(temp_dir)
+            (config_dir / "client_secret.json").write_text("{}")
+            profile = GwsProfile(name="personal", config_dir=str(config_dir))
+
+            diagnostic = inspect_profile_local(profile)
+
+        self.assertEqual(diagnostic.status, "Login required")
+        self.assertTrue(diagnostic.client_config_exists)
+        self.assertFalse(diagnostic.encrypted_credentials_exists)
 
     def test_inspect_profile_reports_request_failure_when_probe_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

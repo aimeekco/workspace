@@ -131,19 +131,37 @@ def _derive_profile_name(config_dir: str, by_name: dict[str, GwsProfile]) -> str
     return f"{candidate}-{index}"
 
 
-def inspect_profile(profile: GwsProfile, binary: str = "gws") -> GwsProfileDiagnostic:
+def inspect_profile_local(profile: GwsProfile) -> GwsProfileDiagnostic:
     config_dir = Path(profile.config_dir).expanduser()
     client_config = config_dir / "client_secret.json"
     encrypted_credentials = config_dir / "credentials.enc"
-    diagnostic = GwsProfileDiagnostic(
+    client_config_exists = client_config.exists()
+    encrypted_credentials_exists = encrypted_credentials.exists()
+
+    if not client_config_exists:
+        status = "Needs OAuth client"
+        detail = "Missing client_secret.json"
+    elif encrypted_credentials_exists:
+        status = "Checking..."
+        detail = "Saved credentials detected; running live auth check"
+    else:
+        status = "Login required"
+        detail = "OAuth client present, but no saved credentials"
+
+    return GwsProfileDiagnostic(
         name=profile.name,
         config_dir=str(config_dir),
-        client_config_exists=client_config.exists(),
-        encrypted_credentials_exists=encrypted_credentials.exists(),
+        client_config_exists=client_config_exists,
+        encrypted_credentials_exists=encrypted_credentials_exists,
         has_refresh_token=False,
-        status="Needs OAuth client" if not client_config.exists() else "Login required",
-        detail="Missing client_secret.json" if not client_config.exists() else "No saved refresh token",
+        status=status,
+        detail=detail,
     )
+
+
+def inspect_profile(profile: GwsProfile, binary: str = "gws") -> GwsProfileDiagnostic:
+    diagnostic = inspect_profile_local(profile)
+    config_dir = Path(profile.config_dir).expanduser()
 
     env = dict(os.environ)
     env["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"] = str(config_dir)

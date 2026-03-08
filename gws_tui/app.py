@@ -5,6 +5,7 @@ from collections import deque
 from datetime import date
 from datetime import datetime
 import os
+import time
 
 from rich import box
 from rich.console import Group
@@ -25,7 +26,7 @@ from gws_tui.modules.drive import DriveModule
 from gws_tui.modules.docs import DocsModule
 from gws_tui.modules.gmail import GmailModule
 from gws_tui.modules.sheets import SheetsModule
-from gws_tui.profiles import GwsProfile, GwsProfileDiagnostic, discover_profiles, inspect_profile
+from gws_tui.profiles import GwsProfile, GwsProfileDiagnostic, discover_profiles, inspect_profile, inspect_profile_local
 
 MODULE_ACCENTS = {
     "gmail": "#88c0d0",
@@ -34,6 +35,8 @@ MODULE_ACCENTS = {
     "sheets": "#b8d78d",
     "docs": "#ebcb8b",
 }
+
+PROFILE_DIAGNOSTICS_TTL_SECONDS = 30.0
 
 
 class PassiveScrollableContainer(ScrollableContainer):
@@ -63,12 +66,12 @@ class ProfilePickerScreen(ModalScreen[str | None]):
     def compose(self) -> ComposeResult:
         with Container(id="profile-modal", classes="modal-window"):
             yield Static(self.title, classes="modal-title")
-            yield Static("Profiles map to separate gws config directories.", classes="modal-subtitle")
+            yield Static("Each profile maps to a separate gws config directory.", classes="modal-subtitle")
             with Horizontal(id="profile-body"):
                 yield ListView(
                     *(
                         ListItem(
-                            Static(self._profile_label(profile)),
+                            Static(self._profile_label(profile), classes="profile-item"),
                             name=profile.name,
                         )
                         for profile in self.profiles
@@ -122,13 +125,19 @@ class ProfilePickerScreen(ModalScreen[str | None]):
             return None
         return self.profiles[profile_list.index].name
 
-    def _profile_label(self, profile: GwsProfile) -> str:
+    def _profile_label(self, profile: GwsProfile) -> Text:
         diagnostic = self.diagnostics.get(profile.name)
         status = diagnostic.status if diagnostic is not None else "Unknown"
-        label = f"{profile.name}  [{status}]"
+        text = Text()
+        text.append(profile.name, style="bold #f2f2f2")
         if profile.name == self.current_profile_name:
-            label += "  [current]"
-        return label
+            text.append("  current", style="bold #a3be8c")
+        text.append("\n")
+        text.append(status, style=f"bold {self._status_color(status)}")
+        if diagnostic is not None:
+            text.append("  ")
+            text.append(self._shorten_path(diagnostic.config_dir), style="#8f959f")
+        return text
 
     def _update_detail(self, profile_name: str | None) -> None:
         if profile_name is None:
@@ -138,30 +147,100 @@ class ProfilePickerScreen(ModalScreen[str | None]):
         if diagnostic is None:
             self.query_one("#profile-detail", Static).update("No profile diagnostics available.")
             return
-        lines = [
-            f"Profile: {diagnostic.name}",
-            f"Status: {diagnostic.status}",
-            "",
-            f"Config dir: {diagnostic.config_dir}",
-            f"OAuth client: {'yes' if diagnostic.client_config_exists else 'no'}",
-            f"Encrypted credentials: {'yes' if diagnostic.encrypted_credentials_exists else 'no'}",
-            f"Refresh token: {'yes' if diagnostic.has_refresh_token else 'no'}",
-            f"Request probe: {'ok' if diagnostic.probe_ok else 'failed'}",
-        ]
+        detail = Text()
+        detail.append(diagnostic.name, style="bold #f2f2f2")
+        if diagnostic.name == self.current_profile_name:
+            detail.append("  current", style="bold #a3be8c")
+        detail.append("\n")
+        detail.append(diagnostic.status, style=f"bold {self._status_color(diagnostic.status)}")
+        detail.append("\n\n")
+
+        detail.append("Config dir", style="bold #d8dee9")
+        detail.append(f"\n{diagnostic.config_dir}\n\n", style="#a7adba")
+
+        detail.append("Checks", style="bold #d8dee9")
+        detail.append("\n")
+        detail.append(self._flag("OAuth client", diagnostic.client_config_exists))
+        detail.append("\n")
+        detail.append(self._flag("Saved credentials", diagnostic.encrypted_credentials_exists))
+        detail.append("\n")
+        detail.append(self._flag("Refresh token", diagnostic.has_refresh_token))
+        detail.append("\n")
+        probe_ok = diagnostic.probe_ok
+        probe_state = "ok" if probe_ok else ("pending" if diagnostic.status == "Checking..." else "failed")
+        detail.append("Request probe", style="#d8dee9")
+        detail.append(": ")
+        detail.append(probe_state, style=f"bold {self._probe_color(probe_state)}")
+        detail.append("\n")
         if diagnostic.project_id:
-            lines.append(f"Project: {diagnostic.project_id}")
+            detail.append("Project", style="#d8dee9")
+            detail.append(f": {diagnostic.project_id}\n", style="#a7adba")
         if diagnostic.probe_message:
-            lines.append(f"Probe detail: {diagnostic.probe_message}")
-        if diagnostic.detail:
-            lines.extend(["", diagnostic.detail])
+            detail.append("\nProbe detail\n", style="bold #d8dee9")
+            detail.append(diagnostic.probe_message, style="#a7adba")
+        elif diagnostic.detail:
+            detail.append("\nNotes\n", style="bold #d8dee9")
+            detail.append(diagnostic.detail, style="#a7adba")
         self.query_one("#profile-detail", Static).update(
             Panel(
-                Text("\n".join(lines)),
+                detail,
                 title="Auth Diagnostics",
-                border_style="#3a3a3a",
+                border_style=self._status_color(diagnostic.status),
                 box=box.ROUNDED,
             )
         )
+
+    def update_diagnostic(self, diagnostic: GwsProfileDiagnostic) -> None:
+        self.diagnostics[diagnostic.name] = diagnostic
+        try:
+            self._rerender_profile_list()
+            self._update_detail(self._selected_name())
+        except Exception:  # noqa: BLE001
+            return
+
+    def _rerender_profile_list(self) -> None:
+        profile_list = self.query_one("#profile-list", ListView)
+        selected_name = self._selected_name()
+        profile_list.clear()
+        selected_index = 0
+        for index, profile in enumerate(self.profiles):
+            profile_list.append(ListItem(Static(self._profile_label(profile), classes="profile-item"), name=profile.name))
+            if profile.name == selected_name:
+                selected_index = index
+        if self.profiles:
+            profile_list.index = selected_index
+
+    def _status_color(self, status: str) -> str:
+        normalized = status.lower()
+        if "ready" in normalized:
+            return "#a3be8c"
+        if "checking" in normalized:
+            return "#88c0d0"
+        if "request failed" in normalized:
+            return "#bf616a"
+        if "oauth" in normalized or "login required" in normalized:
+            return "#ebcb8b"
+        return "#d8dee9"
+
+    def _probe_color(self, state: str) -> str:
+        if state == "ok":
+            return "#a3be8c"
+        if state == "pending":
+            return "#88c0d0"
+        return "#bf616a"
+
+    def _flag(self, label: str, value: bool) -> Text:
+        text = Text()
+        text.append(label, style="#d8dee9")
+        text.append(": ")
+        text.append("yes" if value else "no", style=f"bold {'#a3be8c' if value else '#bf616a'}")
+        return text
+
+    def _shorten_path(self, path: str) -> str:
+        home = os.path.expanduser("~")
+        if path.startswith(home):
+            return path.replace(home, "~", 1)
+        return path
 
 
 class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
@@ -1625,30 +1704,38 @@ class Workspace(App):
     }
 
     #profile-list {
-        height: 10;
-        width: 34;
+        height: 12;
+        width: 38;
         border: tall #343434;
         margin-bottom: 1;
         background: transparent;
     }
 
     #profile-modal {
-        width: 110;
+        width: 118;
         max-width: 96%;
     }
 
     #profile-body {
-        height: 14;
+        height: 16;
         margin-bottom: 1;
     }
 
     #profile-detail-pane {
         width: 1fr;
         margin-left: 1;
+        border: tall #343434;
+        padding: 0 1;
+        background: #1b1b1b;
     }
 
     #profile-detail {
         height: 1fr;
+    }
+
+    .profile-item {
+        height: auto;
+        padding: 0 1;
     }
 
     #labels-empty {
@@ -1691,6 +1778,8 @@ class Workspace(App):
         self.activity_lines: deque[Text] = deque(maxlen=60)
         self.profiles, default_profile_name = discover_profiles()
         self.current_profile_name = default_profile_name
+        self.profile_diagnostics_cache: dict[str, GwsProfileDiagnostic] = {}
+        self.profile_diagnostics_loaded_at = 0.0
         self.client = client or GwsClient()
         if isinstance(self.client, GwsClient):
             self.client.observer = self._on_gws_event
@@ -1741,9 +1830,10 @@ class Workspace(App):
         module_list = self.query_one(ListView)
         module_list.index = 0
         self._refresh_profile_label()
-        self._show_module(self.current_module_id)
         if self.prompt_for_profile_on_mount:
             self._open_profile_picker("Choose Workspace Profile")
+            return
+        self._show_module(self.current_module_id)
 
     def on_key(self, event: Key) -> None:
         if not event.character or not event.character.isdigit():
@@ -2045,17 +2135,26 @@ class Workspace(App):
         return None
 
     def _open_profile_picker(self, title: str = "Switch Workspace Profile") -> None:
-        diagnostics = {profile.name: inspect_profile(profile, self.client.binary) for profile in self.profiles}
+        profiles, default_profile_name = discover_profiles()
+        self.profiles = profiles
+        if self.current_profile_name is None or not any(profile.name == self.current_profile_name for profile in profiles):
+            self.current_profile_name = default_profile_name
+        diagnostics = self._profile_diagnostics_snapshot()
+        screen = ProfilePickerScreen(self.profiles, diagnostics, self.current_profile_name, title=title)
         self.push_screen(
-            ProfilePickerScreen(self.profiles, diagnostics, self.current_profile_name, title=title),
+            screen,
             self._handle_profile_result,
         )
+        if self._should_refresh_profile_diagnostics():
+            self._load_profile_diagnostics(screen, list(self.profiles))
 
     def _handle_profile_result(self, profile_name: str | None) -> None:
         if profile_name is None:
+            self._ensure_current_module_loaded()
             self.update_status("Profile switch cancelled")
             return
         if profile_name == self.current_profile_name:
+            self._ensure_current_module_loaded()
             self.update_status(f"Workspace profile unchanged: {profile_name}")
             return
         profile = next((item for item in self.profiles if item.name == profile_name), None)
@@ -2083,6 +2182,41 @@ class Workspace(App):
         if self.current_profile_name:
             label = f"gws activity · {self.current_profile_name}"
         self.query_one("#activity-label", Static).update(label)
+
+    def _profile_diagnostics_snapshot(self) -> dict[str, GwsProfileDiagnostic]:
+        diagnostics: dict[str, GwsProfileDiagnostic] = {}
+        for profile in self.profiles:
+            cached = self.profile_diagnostics_cache.get(profile.name)
+            diagnostics[profile.name] = cached or inspect_profile_local(profile)
+        return diagnostics
+
+    def _should_refresh_profile_diagnostics(self) -> bool:
+        if not self.profile_diagnostics_cache:
+            return True
+        if any(profile.name not in self.profile_diagnostics_cache for profile in self.profiles):
+            return True
+        return (time.monotonic() - self.profile_diagnostics_loaded_at) > PROFILE_DIAGNOSTICS_TTL_SECONDS
+
+    def _ensure_current_module_loaded(self) -> None:
+        self.module_views[self.current_module_id].load_if_needed()
+
+    @work(thread=True, exclusive=True)
+    def _load_profile_diagnostics(self, screen: ProfilePickerScreen, profiles: list[GwsProfile]) -> None:
+        for profile in profiles:
+            diagnostic = inspect_profile(profile, self.client.binary)
+            self.call_from_thread(self._update_profile_diagnostic, screen, diagnostic)
+        self.call_from_thread(self._mark_profile_diagnostics_refreshed)
+
+    def _update_profile_diagnostic(self, screen: ProfilePickerScreen, diagnostic: GwsProfileDiagnostic) -> None:
+        self.profile_diagnostics_cache[diagnostic.name] = diagnostic
+        try:
+            if screen in self.screen_stack:
+                screen.update_diagnostic(diagnostic)
+        except Exception:  # noqa: BLE001
+            return
+
+    def _mark_profile_diagnostics_refreshed(self) -> None:
+        self.profile_diagnostics_loaded_at = time.monotonic()
 
     def _handle_event_result(self, result: dict[str, str] | None) -> None:
         if result is None:
