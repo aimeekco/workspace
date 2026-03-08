@@ -216,6 +216,14 @@ class GmailModule(WorkspaceModule):
         self.selected_mailbox_name = "Inbox"
         self.mailboxes = []
 
+    def is_unread(self, label_ids: list[str] | None) -> bool:
+        return "UNREAD" in (label_ids or [])
+
+    def format_subject_cell(self, subject: str, label_ids: list[str] | None) -> str:
+        if self.is_unread(label_ids):
+            return f"● {subject}"
+        return subject
+
     def build_raw_message(
         self,
         to: str,
@@ -307,6 +315,7 @@ class GmailModule(WorkspaceModule):
             subject = header_value(headers, "Subject", "No subject")
             sender = header_value(headers, "From", "Unknown sender")
             date = format_message_date(header_value(headers, "Date", "Unknown date"))
+            label_ids = metadata.get("labelIds", [])
             preview = "\n".join(
                 [
                     f"From: {sender}",
@@ -319,13 +328,14 @@ class GmailModule(WorkspaceModule):
             records.append(
                 Record(
                     key=message_id,
-                    columns=(subject, sender, date),
+                    columns=(self.format_subject_cell(subject, label_ids), sender, date),
                     title=subject,
                     subtitle=sender,
                     preview=preview,
                     raw={
                         "headers": headers,
-                        "label_ids": metadata.get("labelIds", []),
+                        "label_ids": label_ids,
+                        "unread": self.is_unread(label_ids),
                         "thread_id": metadata.get("threadId"),
                         "mailbox_id": self.selected_mailbox_id,
                     },

@@ -416,6 +416,42 @@ class GmailHelpersTest(unittest.TestCase):
         self.assertEqual(client.calls[-1][2]["labelIds"], "SENT")
         self.assertEqual(module.list_label(), "Sent")
 
+    def test_fetch_records_prefixes_unread_subjects(self) -> None:
+        client = StubClient()
+        module = GmailModule()
+        client.add(
+            ("gmail", "users", "labels", "list", "[('userId', 'me')]"),
+            {
+                "labels": [
+                    {"id": "INBOX", "name": "INBOX", "type": "SYSTEM"},
+                ]
+            },
+        )
+        client.add(
+            ("gmail", "users", "messages", "list", "[('labelIds', 'INBOX'), ('maxResults', 20), ('userId', 'me')]"),
+            {"messages": [{"id": "msg-1"}]},
+        )
+        client.add(
+            ("gmail", "users", "messages", "get", "[('format', 'metadata'), ('id', 'msg-1'), ('userId', 'me')]"),
+            {
+                "threadId": "thread-1",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Project update"},
+                        {"name": "From", "value": "A <a@example.com>"},
+                        {"name": "Date", "value": "Fri, 06 Mar 2026 10:00:00 +0000"},
+                    ]
+                },
+                "snippet": "Hello",
+                "labelIds": ["INBOX", "UNREAD"],
+            },
+        )
+
+        records = module.fetch_records(client)  # type: ignore[arg-type]
+
+        self.assertEqual(records[0].columns[0], "● Project update")
+        self.assertTrue(records[0].raw["unread"])
+
     def test_fetch_detail_reads_thread_messages(self) -> None:
         client = StubClient()
         module = GmailModule()
