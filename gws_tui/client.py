@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -30,6 +31,7 @@ class GwsClient:
 
     binary: str = "gws"
     observer: Callable[[GwsCommandEvent], None] | None = None
+    config_dir: str | None = None
 
     def run(
         self,
@@ -55,6 +57,7 @@ class GwsClient:
             capture_output=True,
             text=True,
             check=False,
+            env=self._command_env(),
         )
         if result.returncode != 0:
             stderr = result.stderr.strip() or "gws command failed"
@@ -82,3 +85,9 @@ class GwsClient:
         if self.observer is None:
             return
         self.observer(GwsCommandEvent(command=list(command), status=status, detail=detail))
+
+    def _command_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        if self.config_dir:
+            env["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"] = self.config_dir
+        return env

@@ -127,6 +127,11 @@ class DriveModule(WorkspaceModule):
             return
         self.current_folder_id, self.current_folder_name = self.folder_stack.pop()
 
+    def reset_state(self) -> None:
+        self.current_folder_id = "root"
+        self.current_folder_name = "My Drive"
+        self.folder_stack = []
+
     def fetch_detail(self, client: GwsClient, record: Record) -> str:
         item = client.run(
             "drive",

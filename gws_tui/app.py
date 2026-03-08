@@ -4,6 +4,7 @@ import calendar as calendar_lib
 from collections import deque
 from datetime import date
 from datetime import datetime
+import os
 
 from rich import box
 from rich.console import Group
@@ -24,6 +25,7 @@ from gws_tui.modules.drive import DriveModule
 from gws_tui.modules.docs import DocsModule
 from gws_tui.modules.gmail import GmailModule
 from gws_tui.modules.sheets import SheetsModule
+from gws_tui.profiles import GwsProfile, GwsProfileDiagnostic, discover_profiles, inspect_profile
 
 MODULE_ACCENTS = {
     "gmail": "#88c0d0",
@@ -38,6 +40,128 @@ class PassiveScrollableContainer(ScrollableContainer):
     """Scrollable container that doesn't participate in keyboard focus order."""
 
     can_focus = False
+
+
+class ProfilePickerScreen(ModalScreen[str | None]):
+    """Choose an authenticated gws profile."""
+
+    BINDINGS = [("escape", "cancel", "Cancel"), ("enter", "select_profile", "Select")]
+
+    def __init__(
+        self,
+        profiles: list[GwsProfile],
+        diagnostics: dict[str, GwsProfileDiagnostic],
+        current_profile_name: str | None,
+        title: str = "Switch Workspace Profile",
+    ) -> None:
+        super().__init__()
+        self.profiles = profiles
+        self.diagnostics = diagnostics
+        self.current_profile_name = current_profile_name
+        self.title = title
+
+    def compose(self) -> ComposeResult:
+        with Container(id="profile-modal", classes="modal-window"):
+            yield Static(self.title, classes="modal-title")
+            yield Static("Profiles map to separate gws config directories.", classes="modal-subtitle")
+            with Horizontal(id="profile-body"):
+                yield ListView(
+                    *(
+                        ListItem(
+                            Static(self._profile_label(profile)),
+                            name=profile.name,
+                        )
+                        for profile in self.profiles
+                    ),
+                    id="profile-list",
+                )
+                with PassiveScrollableContainer(id="profile-detail-pane"):
+                    yield Static("", id="profile-detail")
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel", id="profile-cancel")
+                yield Button("Use Profile", variant="primary", id="profile-submit")
+
+    def on_mount(self) -> None:
+        profile_list = self.query_one("#profile-list", ListView)
+        default_index = 0
+        for index, profile in enumerate(self.profiles):
+            if profile.name == self.current_profile_name:
+                default_index = index
+                break
+        profile_list.index = default_index
+        profile_list.focus()
+        self._update_detail(self.profiles[default_index].name if self.profiles else None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_select_profile(self) -> None:
+        selected = self._selected_name()
+        self.dismiss(selected)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "profile-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id == "profile-submit":
+            self.action_select_profile()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.list_view.id != "profile-list":
+            return
+        self.action_select_profile()
+
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        if event.list_view.id != "profile-list" or event.item is None:
+            return
+        self._update_detail(event.item.name)
+
+    def _selected_name(self) -> str | None:
+        profile_list = self.query_one("#profile-list", ListView)
+        if profile_list.index is None or not self.profiles:
+            return None
+        return self.profiles[profile_list.index].name
+
+    def _profile_label(self, profile: GwsProfile) -> str:
+        diagnostic = self.diagnostics.get(profile.name)
+        status = diagnostic.status if diagnostic is not None else "Unknown"
+        label = f"{profile.name}  [{status}]"
+        if profile.name == self.current_profile_name:
+            label += "  [current]"
+        return label
+
+    def _update_detail(self, profile_name: str | None) -> None:
+        if profile_name is None:
+            self.query_one("#profile-detail", Static).update("")
+            return
+        diagnostic = self.diagnostics.get(profile_name)
+        if diagnostic is None:
+            self.query_one("#profile-detail", Static).update("No profile diagnostics available.")
+            return
+        lines = [
+            f"Profile: {diagnostic.name}",
+            f"Status: {diagnostic.status}",
+            "",
+            f"Config dir: {diagnostic.config_dir}",
+            f"OAuth client: {'yes' if diagnostic.client_config_exists else 'no'}",
+            f"Encrypted credentials: {'yes' if diagnostic.encrypted_credentials_exists else 'no'}",
+            f"Refresh token: {'yes' if diagnostic.has_refresh_token else 'no'}",
+            f"Request probe: {'ok' if diagnostic.probe_ok else 'failed'}",
+        ]
+        if diagnostic.project_id:
+            lines.append(f"Project: {diagnostic.project_id}")
+        if diagnostic.probe_message:
+            lines.append(f"Probe detail: {diagnostic.probe_message}")
+        if diagnostic.detail:
+            lines.extend(["", diagnostic.detail])
+        self.query_one("#profile-detail", Static).update(
+            Panel(
+                Text("\n".join(lines)),
+                title="Auth Diagnostics",
+                border_style="#3a3a3a",
+                box=box.ROUNDED,
+            )
+        )
 
 
 class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
@@ -748,6 +872,12 @@ class CalendarGridView(PassiveScrollableContainer):
             return []
         return list(self.day_records.get(selected_day.isoformat(), []))
 
+    def reset_state(self) -> None:
+        self.day_records = {}
+        self.coordinate_day = {}
+        self.month_anchor = date.today().replace(day=1)
+        self.loaded = False
+
 
 class ModuleView(PassiveScrollableContainer):
     """A reusable list/detail view for a workspace module."""
@@ -928,6 +1058,13 @@ class ModuleView(PassiveScrollableContainer):
         if self.current_key is None:
             return None
         return self.records.get(self.current_key)
+
+    def reset_state(self) -> None:
+        self.records = {}
+        self.current_key = None
+        self.detail_cache.clear()
+        self.detail_label = "Preview"
+        self.loaded = False
 
 
 class GmailView(PassiveScrollableContainer):
@@ -1146,6 +1283,13 @@ class GmailView(PassiveScrollableContainer):
         if self.current_key is None:
             return None
         return self.records.get(self.current_key)
+
+    def reset_state(self) -> None:
+        self.records = {}
+        self.current_key = None
+        self.detail_cache.clear()
+        self.detail_label = "Preview"
+        self.loaded = False
 
 
 class DriveView(ModuleView):
@@ -1408,7 +1552,7 @@ class Workspace(App):
         border: tall #343434;
     }
 
-    ComposeEmailScreen, CreateEventScreen, ConfirmDeleteScreen, DeleteCalendarEventScreen, LabelEditorScreen, GmailSearchScreen, CreateDocumentScreen, EditDocumentScreen, EditSheetScreen {
+    ProfilePickerScreen, ComposeEmailScreen, CreateEventScreen, ConfirmDeleteScreen, DeleteCalendarEventScreen, LabelEditorScreen, GmailSearchScreen, CreateDocumentScreen, EditDocumentScreen, EditSheetScreen {
         align: center middle;
     }
 
@@ -1480,6 +1624,33 @@ class Workspace(App):
         background: transparent;
     }
 
+    #profile-list {
+        height: 10;
+        width: 34;
+        border: tall #343434;
+        margin-bottom: 1;
+        background: transparent;
+    }
+
+    #profile-modal {
+        width: 110;
+        max-width: 96%;
+    }
+
+    #profile-body {
+        height: 14;
+        margin-bottom: 1;
+    }
+
+    #profile-detail-pane {
+        width: 1fr;
+        margin-left: 1;
+    }
+
+    #profile-detail {
+        height: 1fr;
+    }
+
     #labels-empty {
         color: #a8a8a8;
     }
@@ -1505,6 +1676,7 @@ class Workspace(App):
         ("f", "forward_email", "Forward"),
         ("l", "edit_labels", "Labels"),
         ("n", "create_doc", "New Doc"),
+        ("p", "switch_profile", "Profiles"),
         ("/", "search_email", "Search"),
         ("u", "toggle_unread_filter", "Unread"),
         ("[", "previous_calendar_month", "Prev Month"),
@@ -1517,12 +1689,21 @@ class Workspace(App):
     def __init__(self, client: GwsClient | None = None) -> None:
         super().__init__()
         self.activity_lines: deque[Text] = deque(maxlen=60)
+        self.profiles, default_profile_name = discover_profiles()
+        self.current_profile_name = default_profile_name
         self.client = client or GwsClient()
         if isinstance(self.client, GwsClient):
             self.client.observer = self._on_gws_event
+            if self.current_profile is not None and not self.client.config_dir:
+                self.client.config_dir = self.current_profile.config_dir
         self.modules = built_in_modules()
         self.module_views: dict[str, ModuleView] = {}
         self.current_module_id = self.modules[0].id
+        self.prompt_for_profile_on_mount = (
+            len(self.profiles) > 1
+            and not os.environ.get("GWS_TUI_PROFILE", "").strip()
+            and not os.environ.get("GOOGLE_WORKSPACE_CLI_CONFIG_DIR", "").strip()
+        )
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1559,7 +1740,10 @@ class Workspace(App):
     def on_mount(self) -> None:
         module_list = self.query_one(ListView)
         module_list.index = 0
+        self._refresh_profile_label()
         self._show_module(self.current_module_id)
+        if self.prompt_for_profile_on_mount:
+            self._open_profile_picker("Choose Workspace Profile")
 
     def on_key(self, event: Key) -> None:
         if not event.character or not event.character.isdigit():
@@ -1670,6 +1854,12 @@ class Workspace(App):
             self.update_status("New doc is only available in Docs")
             return
         self.push_screen(CreateDocumentScreen(), self._handle_create_doc_result)
+
+    def action_switch_profile(self) -> None:
+        if len(self.profiles) <= 1:
+            self.update_status("Only one workspace profile is available")
+            return
+        self._open_profile_picker()
 
     def action_reply_email(self) -> None:
         gmail_module = self._current_gmail_module()
@@ -1824,6 +2014,12 @@ class Workspace(App):
         self.query_one(ContentSwitcher).current = f"frame-{module_id}"
         self.module_views[module_id].load_if_needed()
 
+    @property
+    def current_profile(self) -> GwsProfile | None:
+        if self.current_profile_name is None:
+            return None
+        return next((profile for profile in self.profiles if profile.name == self.current_profile_name), None)
+
     def _current_calendar_module(self) -> CalendarModule | None:
         for module in self.modules:
             if module.id == self.current_module_id and isinstance(module, CalendarModule):
@@ -1847,6 +2043,46 @@ class Workspace(App):
             if module.id == self.current_module_id and isinstance(module, SheetsModule):
                 return module
         return None
+
+    def _open_profile_picker(self, title: str = "Switch Workspace Profile") -> None:
+        diagnostics = {profile.name: inspect_profile(profile, self.client.binary) for profile in self.profiles}
+        self.push_screen(
+            ProfilePickerScreen(self.profiles, diagnostics, self.current_profile_name, title=title),
+            self._handle_profile_result,
+        )
+
+    def _handle_profile_result(self, profile_name: str | None) -> None:
+        if profile_name is None:
+            self.update_status("Profile switch cancelled")
+            return
+        if profile_name == self.current_profile_name:
+            self.update_status(f"Workspace profile unchanged: {profile_name}")
+            return
+        profile = next((item for item in self.profiles if item.name == profile_name), None)
+        if profile is None:
+            self.update_status(f"Unknown workspace profile: {profile_name}")
+            return
+        self._set_profile(profile)
+
+    def _set_profile(self, profile: GwsProfile) -> None:
+        self.current_profile_name = profile.name
+        if isinstance(self.client, GwsClient):
+            self.client.config_dir = profile.config_dir
+        self.activity_lines.clear()
+        self.query_one("#activity-log", Static).update("")
+        self._refresh_profile_label()
+        for module in self.modules:
+            module.reset_state()
+        for view in self.module_views.values():
+            view.reset_state()
+        self._show_module(self.current_module_id)
+        self.update_status(f"Workspace profile: {profile.name}")
+
+    def _refresh_profile_label(self) -> None:
+        label = "gws activity"
+        if self.current_profile_name:
+            label = f"gws activity · {self.current_profile_name}"
+        self.query_one("#activity-label", Static).update(label)
 
     def _handle_event_result(self, result: dict[str, str] | None) -> None:
         if result is None:

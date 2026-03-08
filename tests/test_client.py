@@ -64,6 +64,19 @@ class GwsClientTest(unittest.TestCase):
         self.assertEqual([event.status for event in events], ["start", "ok"])
         self.assertEqual(events[0].command[:3], ["gws", "calendar", "calendarList"])
 
+    def test_run_uses_profile_config_dir_in_environment(self) -> None:
+        client = GwsClient(config_dir="/tmp/gws-work")
+        completed = subprocess.CompletedProcess(
+            args=["gws"],
+            returncode=0,
+            stdout="{}",
+            stderr="",
+        )
+        with patch("subprocess.run", return_value=completed) as run_mock:
+            client.run("drive", "files", "list")
+
+        self.assertEqual(run_mock.call_args.kwargs["env"]["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"], "/tmp/gws-work")
+
 
 if __name__ == "__main__":
     unittest.main()

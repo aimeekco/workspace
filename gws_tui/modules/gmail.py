@@ -209,6 +209,13 @@ class GmailModule(WorkspaceModule):
         self.unread_only = not self.unread_only
         return self.unread_only
 
+    def reset_state(self) -> None:
+        self.search_query = ""
+        self.unread_only = False
+        self.selected_mailbox_id = "INBOX"
+        self.selected_mailbox_name = "Inbox"
+        self.mailboxes = []
+
     def build_raw_message(
         self,
         to: str,

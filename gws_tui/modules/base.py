@@ -30,6 +30,9 @@ class WorkspaceModule(ABC):
     def list_label(self) -> str:
         return "Results"
 
+    def reset_state(self) -> None:
+        """Reset module-specific state when switching accounts."""
+
     @abstractmethod
     def fetch_records(self, client: GwsClient) -> list[Record]:
         raise NotImplementedError
