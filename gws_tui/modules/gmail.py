@@ -599,6 +599,19 @@ class GmailModule(WorkspaceModule):
             },
         )
 
+    def mark_message_read(self, client: GwsClient, message_id: str) -> dict:
+        return client.run(
+            "gmail",
+            "users",
+            "messages",
+            "modify",
+            params={"userId": "me", "id": message_id},
+            body={
+                "addLabelIds": [],
+                "removeLabelIds": ["UNREAD"],
+            },
+        )
+
     def trash_message(self, client: GwsClient, message_id: str) -> dict:
         return client.run(
             "gmail",
@@ -609,6 +622,11 @@ class GmailModule(WorkspaceModule):
         )
 
     def fetch_detail(self, client: GwsClient, record: Record) -> str:
+        if record.raw.get("unread"):
+            self.mark_message_read(client, record.key)
+            label_ids = [label_id for label_id in record.raw.get("label_ids", []) if label_id != "UNREAD"]
+            record.raw["label_ids"] = label_ids
+            record.raw["unread"] = False
         thread_id = str(record.raw.get("thread_id") or "").strip()
         if thread_id:
             return self.fetch_thread_detail(client, record, thread_id)

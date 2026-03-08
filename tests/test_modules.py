@@ -615,6 +615,44 @@ class GmailHelpersTest(unittest.TestCase):
         self.assertEqual(client.calls[-1][1], ("users", "messages", "modify"))
         self.assertEqual(client.calls[-1][3], {"addLabelIds": ["Label_2"], "removeLabelIds": ["Label_1"]})
 
+    def test_fetch_detail_marks_unread_message_read(self) -> None:
+        client = StubClient()
+        module = GmailModule()
+        client.add(
+            ("gmail", "users", "messages", "modify", "[('id', 'msg-1'), ('userId', 'me')]"),
+            {"id": "msg-1"},
+        )
+        client.add(
+            ("gmail", "users", "messages", "get", "[('format', 'full'), ('id', 'msg-1'), ('userId', 'me')]"),
+            {
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Hello"},
+                        {"name": "From", "value": "Alice <alice@example.com>"},
+                        {"name": "To", "value": "me@example.com"},
+                        {"name": "Date", "value": "Fri, 06 Mar 2026 10:00:00 +0000"},
+                    ],
+                    "body": {"data": "SGVsbG8"},
+                },
+                "snippet": "Hello",
+                "labelIds": ["INBOX"],
+            },
+        )
+        record = Record(
+            key="msg-1",
+            columns=("● Hello", "Alice <alice@example.com>", "Mar 06 10:00 AM"),
+            title="Hello",
+            subtitle="Alice <alice@example.com>",
+            raw={"label_ids": ["INBOX", "UNREAD"], "unread": True},
+        )
+
+        detail = module.fetch_detail(client, record)
+
+        self.assertIn("Subject: Hello", detail)
+        self.assertEqual(client.calls[0][1], ("users", "messages", "modify"))
+        self.assertFalse(record.raw["unread"])
+        self.assertEqual(record.raw["label_ids"], ["INBOX"])
+
 
 class DocsModuleTest(unittest.TestCase):
     def test_extract_document_text_collects_paragraphs(self) -> None:

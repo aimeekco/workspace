@@ -14,6 +14,7 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, ScrollableContainer
+from textual.coordinate import Coordinate
 from textual.events import Key
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, ContentSwitcher, DataTable, Footer, Header, Input, ListItem, ListView, Static, TextArea
@@ -43,6 +44,12 @@ class PassiveScrollableContainer(ScrollableContainer):
     """Scrollable container that doesn't participate in keyboard focus order."""
 
     can_focus = False
+
+
+class FocusableScrollableContainer(ScrollableContainer):
+    """Scrollable container that can receive focus for keyboard scrolling."""
+
+    can_focus = True
 
 
 class ProfilePickerScreen(ModalScreen[str | None]):
@@ -766,7 +773,7 @@ class CalendarGridView(PassiveScrollableContainer):
                 yield DataTable(id="calendar-grid")
             with Container(classes="pane pane-detail"):
                 yield Static("Day Agenda", id="detail-label-calendar", classes="pane-title")
-                with PassiveScrollableContainer(classes="detail-container"):
+                with FocusableScrollableContainer(classes="detail-container"):
                     yield Static("Select a day to view events.", id="detail-calendar")
 
     def on_mount(self) -> None:
@@ -981,7 +988,7 @@ class ModuleView(PassiveScrollableContainer):
                 yield DataTable(id=f"table-{self.module.id}")
             with Container(classes="pane pane-detail"):
                 yield Static("Preview", id=f"detail-label-{self.module.id}", classes="pane-title")
-                with PassiveScrollableContainer(classes="detail-container"):
+                with FocusableScrollableContainer(classes="detail-container"):
                     yield Static(
                         "Select a row to preview. Press Enter for full detail.",
                         id=f"detail-{self.module.id}",
@@ -1172,7 +1179,7 @@ class GmailView(PassiveScrollableContainer):
                 yield DataTable(id="table-gmail")
             with Container(classes="pane pane-mail-detail"):
                 yield Static("Preview", id="detail-label-gmail", classes="pane-title")
-                with PassiveScrollableContainer(classes="detail-container"):
+                with FocusableScrollableContainer(classes="detail-container"):
                     yield Static(
                         "Select a row to preview. Press Enter for full detail.",
                         id="detail-gmail",
@@ -1226,6 +1233,7 @@ class GmailView(PassiveScrollableContainer):
             self.app.call_from_thread(self.app.update_status, "Gmail detail failed")
             return
         self.detail_cache[key] = detail
+        self.app.call_from_thread(self._refresh_row, key)
         self.app.call_from_thread(self._render_detail, detail)
 
     def _render_records(self, records: list[Record]) -> None:
@@ -1243,7 +1251,12 @@ class GmailView(PassiveScrollableContainer):
 
         first_key = records[0].key
         for record in records:
-            table.add_row(*record.columns, key=record.key)
+            table.add_row(
+                self._subject_cell(record),
+                self._sender_cell(record),
+                self._time_cell(record),
+                key=record.key,
+            )
         table.move_cursor(row=0, column=0)
         self.show_preview(first_key)
         self.app.update_status(f"Gmail: loaded {len(records)} records")
@@ -1330,6 +1343,39 @@ class GmailView(PassiveScrollableContainer):
     def _set_detail_label(self, value: str) -> None:
         self.detail_label = value
         self.query_one("#detail-label-gmail", Static).update(value)
+
+    def _refresh_row(self, key: str) -> None:
+        record = self.records.get(key)
+        if record is None:
+            return
+        table = self.query_one("#table-gmail", DataTable)
+        row_index = table.get_row_index(key)
+        table.update_cell_at(Coordinate(row_index, 0), self._subject_cell(record))
+        table.update_cell_at(Coordinate(row_index, 1), self._sender_cell(record))
+        table.update_cell_at(Coordinate(row_index, 2), self._time_cell(record))
+
+    def _subject_cell(self, record: Record) -> Text:
+        unread = bool(record.raw.get("unread"))
+        subject = record.title or record.columns[0]
+        text = Text()
+        if unread:
+            text.append("● ", style="#88c0d0")
+            text.append(subject, style="bold #f2f2f2")
+            return text
+        text.append(subject, style="#d8dee9")
+        return text
+
+    def _sender_cell(self, record: Record) -> Text:
+        unread = bool(record.raw.get("unread"))
+        text = Text(record.columns[1])
+        text.stylize("#e5e9f0" if unread else "#8f959f")
+        return text
+
+    def _time_cell(self, record: Record) -> Text:
+        unread = bool(record.raw.get("unread"))
+        text = Text(record.columns[2])
+        text.stylize("#d8dee9" if unread else "#7f848e")
+        return text
 
     def _state_text(self, heading: str, message: str, hint: str = "") -> str:
         lines = [heading, "", message]
