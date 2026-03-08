@@ -27,11 +27,13 @@ from gws_tui.modules.drive import DriveModule
 from gws_tui.modules.docs import DocsModule
 from gws_tui.modules.gmail import GmailModule
 from gws_tui.modules.sheets import SheetsModule
+from gws_tui.modules.tasks import TasksModule
 from gws_tui.profiles import GwsProfile, GwsProfileDiagnostic, discover_profiles, inspect_profile, inspect_profile_local
 
 MODULE_ACCENTS = {
     "gmail": "#88c0d0",
     "calendar": "#a3be8c",
+    "tasks": "#d08770",
     "drive": "#81a1c1",
     "sheets": "#b8d78d",
     "docs": "#ebcb8b",
@@ -404,6 +406,54 @@ class CreateEventScreen(ModalScreen[dict[str, str] | None]):
             self.query_one("#event-duration", Input).focus()
             return
         self.dismiss(values)
+
+
+class CreateTaskScreen(ModalScreen[dict[str, str] | None]):
+    """Create a Google Task."""
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, tasklist_id: str, tasklist_name: str) -> None:
+        super().__init__()
+        self.tasklist_id = tasklist_id
+        self.tasklist_name = tasklist_name
+
+    def compose(self) -> ComposeResult:
+        with Container(id="task-modal", classes="modal-window"):
+            yield Static("Create Task", classes="modal-title")
+            yield Static(f"Task list: {self.tasklist_name}", classes="modal-subtitle")
+            yield Input(placeholder="Task title", id="task-title")
+            yield Input(placeholder="Optional due date: YYYY-MM-DD", id="task-due")
+            yield TextArea("", id="task-notes")
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel", id="task-cancel")
+                yield Button("Create", variant="primary", id="task-create")
+
+    def on_mount(self) -> None:
+        self.query_one("#task-title", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "task-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id != "task-create":
+            return
+        title = self.query_one("#task-title", Input).value.strip()
+        if not title:
+            self.app.update_status("Task: title is required")
+            self.query_one("#task-title", Input).focus()
+            return
+        self.dismiss(
+            {
+                "tasklist_id": self.tasklist_id,
+                "title": title,
+                "due": self.query_one("#task-due", Input).value.strip(),
+                "notes": self.query_one("#task-notes", TextArea).text.strip(),
+            }
+        )
 
 
 class DeleteCalendarEventScreen(ModalScreen[str | None]):
@@ -1417,6 +1467,228 @@ class GmailView(PassiveScrollableContainer):
         self.loaded = False
 
 
+class TasksView(PassiveScrollableContainer):
+    """Tasks-specific three-pane layout with task list selector."""
+
+    def __init__(self, module: TasksModule, client: GwsClient) -> None:
+        super().__init__(id=f"view-{module.id}")
+        self.module = module
+        self.client = client
+        self.records: dict[str, Record] = {}
+        self.current_key: str | None = None
+        self.detail_cache: dict[str, str] = {}
+        self.detail_label = "Preview"
+        self.loaded = False
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="module-heading"):
+            yield Static(self.module.title, id="title-tasks", classes="module-title")
+            yield Static(self.module.badge(), id="badge-tasks", classes="module-badge")
+        with Horizontal(classes="module-body"):
+            with Container(id="pane-tasklists-tasks", classes="pane pane-mailboxes"):
+                yield Static("Task Lists", classes="pane-title")
+                yield ListView(id="tasklist-list-tasks")
+            with Container(classes="pane pane-mail"):
+                yield Static(self.module.list_label(), id="tasklist-heading-tasks", classes="pane-title")
+                yield DataTable(id="table-tasks")
+            with Container(classes="pane pane-mail-detail"):
+                yield Static("Preview", id="detail-label-tasks", classes="pane-title")
+                with FocusableScrollableContainer(classes="detail-container"):
+                    yield Static("Select a task to preview. Press Enter for full detail.", id="detail-tasks")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#table-tasks", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_column("Task", width=34)
+        table.add_column("List", width=20)
+        table.add_column("Due", width=12)
+        table.show_header = True
+
+    def load_if_needed(self) -> None:
+        if not self.loaded:
+            self.action_refresh()
+
+    def action_refresh(self) -> None:
+        self.loaded = True
+        self.detail_cache.clear()
+        self._set_detail_label("Preview")
+        self._refresh_tasklist_heading()
+        self._set_detail_text(self._state_text("Loading Tasks", self.module.loading_message()))
+        self.app.update_status("Loading tasks...")
+        self._load_records()
+
+    @work(thread=True, exclusive=True)
+    def _load_records(self) -> None:
+        try:
+            records = self.module.fetch_records(self.client)
+        except GwsError as exc:
+            self.app.call_from_thread(self._handle_error, exc.message)
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.app.call_from_thread(self._handle_error, str(exc))
+            return
+        self.app.call_from_thread(self._render_records, records)
+
+    @work(thread=True, exclusive=True)
+    def _load_detail(self, key: str) -> None:
+        record = self.records[key]
+        try:
+            detail = self.module.fetch_detail(self.client, record)
+        except GwsError as exc:
+            self.app.call_from_thread(self._set_detail_text, self._state_text("Tasks detail failed", exc.message))
+            self.app.call_from_thread(self.app.update_status, "Tasks request failed")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.app.call_from_thread(self._set_detail_text, self._state_text("Tasks detail failed", str(exc)))
+            self.app.call_from_thread(self.app.update_status, "Tasks detail failed")
+            return
+        self.detail_cache[key] = detail
+        self.app.call_from_thread(self._render_detail, detail)
+
+    def _render_records(self, records: list[Record]) -> None:
+        self._render_tasklists()
+        self._refresh_tasklist_heading()
+        self.records = {record.key: record for record in records}
+        table = self.query_one("#table-tasks", DataTable)
+        table.clear()
+        if not records:
+            self.current_key = None
+            self._set_detail_label("Preview")
+            self._set_detail_text(self._state_text("No tasks", self.module.empty_message, self.module.empty_hint()))
+            self.app.update_status("Tasks: no records")
+            return
+        first_key = records[0].key
+        for record in records:
+            table.add_row(self._task_cell(record), self._list_cell(record), self._due_cell(record), key=record.key)
+        table.move_cursor(row=0, column=0)
+        self.show_preview(first_key)
+        self.app.update_status(f"Tasks: loaded {len(records)} tasks")
+
+    def _render_tasklists(self) -> None:
+        tasklist_list = self.query_one("#tasklist-list-tasks", ListView)
+        tasklist_list.clear()
+        selected_index = 0
+        for index, tasklist in enumerate(self.module.tasklists):
+            tasklist_list.append(ListItem(Static(tasklist["name"]), name=tasklist["id"]))
+            if tasklist["id"] == self.module.selected_tasklist_id:
+                selected_index = index
+        if self.module.tasklists:
+            tasklist_list.index = selected_index
+        self._apply_tasklist_width()
+
+    def _apply_tasklist_width(self) -> None:
+        longest = max([len("Task Lists"), *(len(tasklist["name"]) for tasklist in self.module.tasklists)], default=len("Task Lists"))
+        width = max(15, longest + 5)
+        self.query_one("#pane-tasklists-tasks", Container).styles.width = width
+
+    def _refresh_tasklist_heading(self) -> None:
+        self.query_one("#tasklist-heading-tasks", Static).update(self.module.list_label())
+
+    def show_preview(self, key: str) -> None:
+        if key not in self.records:
+            return
+        self.current_key = key
+        record = self.records[key]
+        preview = record.preview or f"{record.title}\n{record.subtitle}".strip()
+        self._set_detail_label("Preview")
+        self._set_detail_text(preview)
+        self.app.update_status("Tasks: preview ready, press Enter for full detail")
+
+    def open_record(self, key: str) -> None:
+        if key not in self.records:
+            return
+        self.current_key = key
+        self._set_detail_label("Detail")
+        if key in self.detail_cache:
+            self._render_detail(self.detail_cache[key])
+            return
+        self._set_detail_text(self._state_text("Loading Tasks detail", "Fetching the selected task..."))
+        self.app.update_status("Loading task detail...")
+        self._load_detail(key)
+
+    def _render_detail(self, detail: str) -> None:
+        self.query_one("#detail-tasks", Static).update(
+            Panel(Text(detail), title=self.module.title, subtitle=self.detail_label, border_style=MODULE_ACCENTS["tasks"], box=box.ROUNDED)
+        )
+        self.app.update_status("Tasks: detail loaded")
+
+    def _set_detail_text(self, value: str) -> None:
+        self.query_one("#detail-tasks", Static).update(
+            Panel(Text(value), title=self.module.title, subtitle=self.detail_label, border_style=MODULE_ACCENTS["tasks"], box=box.ROUNDED)
+        )
+
+    def _handle_error(self, message: str) -> None:
+        self._render_tasklists()
+        self._refresh_tasklist_heading()
+        table = self.query_one("#table-tasks", DataTable)
+        table.clear()
+        self.current_key = None
+        self._set_detail_label("Preview")
+        self._set_detail_text(self._state_text("Tasks request failed", message))
+        self.app.update_status("Tasks: request failed")
+
+    def _set_detail_label(self, value: str) -> None:
+        self.detail_label = value
+        self.query_one("#detail-label-tasks", Static).update(value)
+
+    def _state_text(self, heading: str, message: str, hint: str = "") -> str:
+        lines = [heading, "", message]
+        if hint:
+            lines.extend(["", hint])
+        return "\n".join(lines)
+
+    def _task_cell(self, record: Record) -> Text:
+        completed = bool(record.raw.get("completed"))
+        text = Text()
+        text.append("✓ " if completed else "○ ", style="#a3be8c" if completed else "#d08770")
+        text.append(record.title, style="#8f959f" if completed else "bold #f2f2f2")
+        return text
+
+    def _list_cell(self, record: Record) -> Text:
+        text = Text(record.columns[1])
+        text.stylize("#8f959f" if record.raw.get("completed") else "#d8dee9")
+        return text
+
+    def _due_cell(self, record: Record) -> Text:
+        text = Text(record.columns[2])
+        text.stylize("#7f848e" if record.raw.get("completed") else "#d8dee9")
+        return text
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id != "table-tasks" or event.row_key is None:
+            return
+        self.show_preview(str(event.row_key.value))
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "table-tasks" or event.row_key is None:
+            return
+        self.open_record(str(event.row_key.value))
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.list_view.id != "tasklist-list-tasks" or event.item is None:
+            return
+        tasklist_id = event.item.name or ""
+        tasklist = next((item for item in self.module.tasklists if item["id"] == tasklist_id), None)
+        if tasklist is None or tasklist_id == self.module.selected_tasklist_id:
+            return
+        self.module.set_tasklist(tasklist["id"], tasklist["name"])
+        self.app.update_status(f"Tasks list: {tasklist['name']}")
+        self.action_refresh()
+
+    def current_record(self) -> Record | None:
+        if self.current_key is None:
+            return None
+        return self.records.get(self.current_key)
+
+    def reset_state(self) -> None:
+        self.records = {}
+        self.current_key = None
+        self.detail_cache.clear()
+        self.detail_label = "Preview"
+        self.loaded = False
+
+
 class DriveView(ModuleView):
     """Drive-specific list/detail view with folder navigation."""
 
@@ -1604,6 +1876,10 @@ class Workspace(App):
         border: round #4b4636;
     }
 
+    #frame-tasks {
+        border: round #5b4337;
+    }
+
     #frame-docs {
         border: round #5b5131;
     }
@@ -1624,6 +1900,12 @@ class Workspace(App):
     #frame-drive .pane-title,
     #badge-drive {
         color: #d8b56c;
+    }
+
+    #title-tasks,
+    #frame-tasks .pane-title,
+    #badge-tasks {
+        color: #d08770;
     }
 
     #title-docs,
@@ -1671,13 +1953,14 @@ class Workspace(App):
         height: 1fr;
     }
 
-    #mailbox-list-gmail {
+    #mailbox-list-gmail,
+    #tasklist-list-tasks {
         height: 1fr;
         background: transparent;
         border: tall #343434;
     }
 
-    ProfilePickerScreen, ComposeEmailScreen, CreateEventScreen, ConfirmDeleteScreen, DeleteCalendarEventScreen, LabelEditorScreen, GmailSearchScreen, CreateDocumentScreen, EditDocumentScreen, EditSheetScreen {
+    ProfilePickerScreen, ComposeEmailScreen, CreateEventScreen, CreateTaskScreen, ConfirmDeleteScreen, DeleteCalendarEventScreen, LabelEditorScreen, GmailSearchScreen, CreateDocumentScreen, EditDocumentScreen, EditSheetScreen {
         align: center middle;
     }
 
@@ -1718,11 +2001,11 @@ class Workspace(App):
         align: right middle;
     }
 
-    #compose-modal Input, #event-modal Input, #doc-create-modal Input, #gmail-search-modal Input {
+    #compose-modal Input, #event-modal Input, #task-modal Input, #doc-create-modal Input, #gmail-search-modal Input {
         margin-bottom: 1;
     }
 
-    #compose-body, #event-description, #doc-create-body, #doc-edit-body, #sheet-edit-body {
+    #compose-body, #event-description, #task-notes, #doc-create-body, #doc-edit-body, #sheet-edit-body {
         height: 12;
         margin-bottom: 1;
     }
@@ -1801,7 +2084,7 @@ class Workspace(App):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("r", "refresh", "Refresh"),
-        ("a", "add_event", "Add Event"),
+        ("a", "add_event", "Add"),
         ("c", "compose_email", "Compose"),
         ("d", "delete_email", "Trash"),
         ("e", "reply_email", "Reply"),
@@ -1812,6 +2095,7 @@ class Workspace(App):
         ("p", "switch_profile", "Profiles"),
         ("/", "search_email", "Search"),
         ("u", "toggle_unread_filter", "Unread"),
+        ("x", "toggle_task_complete", "Toggle Task"),
         ("[", "previous_calendar_month", "Prev Month"),
         ("]", "next_calendar_month", "Next Month"),
         ("tab", "next_module", "Next"),
@@ -1859,6 +2143,8 @@ class Workspace(App):
                             view = CalendarGridView(module, self.client)
                         elif isinstance(module, GmailModule):
                             view = GmailView(module, self.client)
+                        elif isinstance(module, TasksModule):
+                            view = TasksView(module, self.client)
                         elif isinstance(module, DriveModule):
                             view = DriveView(module, self.client)
                         else:
@@ -1939,9 +2225,18 @@ class Workspace(App):
         self.module_views[self.current_module_id].action_refresh()
 
     def action_add_event(self) -> None:
+        tasks_module = self._current_tasks_module()
+        if tasks_module is not None:
+            tasklist_id = tasks_module.default_create_tasklist_id()
+            tasklist_name = tasks_module.default_create_tasklist_name()
+            if not tasklist_id:
+                self.update_status("Create task: no writable task list available")
+                return
+            self.push_screen(CreateTaskScreen(tasklist_id, tasklist_name), self._handle_create_task_result)
+            return
         calendar_module = self._current_calendar_module()
         if calendar_module is None:
-            self.update_status("Add event is only available in Calendar")
+            self.update_status("Add is only available in Calendar and Tasks")
             return
         default_calendar_id = "primary"
         initial_start = ""
@@ -1990,6 +2285,19 @@ class Workspace(App):
             self.update_status("New doc is only available in Docs")
             return
         self.push_screen(CreateDocumentScreen(), self._handle_create_doc_result)
+
+    def action_toggle_task_complete(self) -> None:
+        tasks_module = self._current_tasks_module()
+        if tasks_module is None:
+            self.update_status("Toggle task is only available in Tasks")
+            return
+        record = self.module_views[self.current_module_id].current_record()
+        if record is None:
+            self.update_status("Toggle task: no task selected")
+            return
+        completed = not bool(record.raw.get("completed"))
+        self.update_status("Updating task status...")
+        self._toggle_task_status(tasks_module, record, completed)
 
     def action_switch_profile(self) -> None:
         if len(self.profiles) <= 1:
@@ -2180,6 +2488,12 @@ class Workspace(App):
                 return module
         return None
 
+    def _current_tasks_module(self) -> TasksModule | None:
+        for module in self.modules:
+            if module.id == self.current_module_id and isinstance(module, TasksModule):
+                return module
+        return None
+
     def _open_profile_picker(self, title: str = "Switch Workspace Profile") -> None:
         profiles, default_profile_name = discover_profiles()
         self.profiles = profiles
@@ -2348,6 +2662,17 @@ class Workspace(App):
             return
         self.update_status("Creating document...")
         self._create_doc(docs_module, result["title"], result["body"])
+
+    def _handle_create_task_result(self, result: dict[str, str] | None) -> None:
+        if result is None:
+            self.update_status("Task creation cancelled")
+            return
+        tasks_module = self._current_tasks_module()
+        if tasks_module is None:
+            self.update_status("Create task is only available in Tasks")
+            return
+        self.update_status("Creating task...")
+        self._create_task(tasks_module, result["tasklist_id"], result["title"], result["notes"], result["due"])
 
     def _handle_edit_doc_result(self, result: dict[str, str] | None, record: Record) -> None:
         if result is None:
@@ -2565,6 +2890,42 @@ class Workspace(App):
             return
         self.call_from_thread(self.update_status, "Document saved")
         self.call_from_thread(self.module_views["docs"].action_refresh)
+
+    @work(thread=True, exclusive=True)
+    def _create_task(
+        self,
+        tasks_module: TasksModule,
+        tasklist_id: str,
+        title: str,
+        notes: str,
+        due_text: str,
+    ) -> None:
+        try:
+            tasks_module.create_task(self.client, tasklist_id=tasklist_id, title=title, notes=notes, due_text=due_text)
+        except ValueError as exc:
+            self.call_from_thread(self.update_status, f"Task create failed: {exc}")
+            return
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Task create failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Task create failed: {exc}")
+            return
+        self.call_from_thread(self.update_status, "Task created")
+        self.call_from_thread(self.module_views["tasks"].action_refresh)
+
+    @work(thread=True, exclusive=True)
+    def _toggle_task_status(self, tasks_module: TasksModule, record: Record, completed: bool) -> None:
+        try:
+            tasks_module.update_task_status(self.client, record=record, completed=completed)
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Task update failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Task update failed: {exc}")
+            return
+        self.call_from_thread(self.update_status, "Task completed" if completed else "Task reopened")
+        self.call_from_thread(self.module_views["tasks"].action_refresh)
 
     @work(thread=True, exclusive=True)
     def _save_sheet(

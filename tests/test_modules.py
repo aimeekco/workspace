@@ -7,11 +7,13 @@ import unittest
 from datetime import timezone
 
 from gws_tui.models import Record
+from gws_tui.modules import built_in_modules
 from gws_tui.modules.calendar import CalendarModule, calendar_is_writable, event_day_keys, format_event_time, parse_duration
 from gws_tui.modules.drive import DriveModule, drive_kind
 from gws_tui.modules.docs import DocsModule, document_body_end_index, extract_document_text
 from gws_tui.modules.gmail import GmailModule, extract_body, format_message_date, normalize_forward_subject, normalize_reply_subject
 from gws_tui.modules.sheets import SheetsModule
+from gws_tui.modules.tasks import TasksModule
 
 
 class StubClient:
@@ -32,6 +34,13 @@ class StubClient:
                 normalized["timeMax"] = "<dynamic>"
         lookup = (service, *segments, repr(sorted(normalized.items())))
         return self.responses[lookup]
+
+
+class BuiltInModulesTest(unittest.TestCase):
+    def test_tasks_is_module_three(self) -> None:
+        modules = built_in_modules()
+
+        self.assertEqual([module.id for module in modules], ["gmail", "calendar", "tasks", "drive", "sheets", "docs"])
 
 
 class CalendarModuleTest(unittest.TestCase):
@@ -1062,6 +1071,169 @@ class DriveModuleTest(unittest.TestCase):
 
         self.assertEqual(module.current_folder_id, "root")
         self.assertEqual(module.list_label(), "My Drive")
+
+
+class TasksModuleTest(unittest.TestCase):
+    def test_fetch_records_aggregates_tasks_across_lists(self) -> None:
+        client = StubClient()
+        module = TasksModule()
+        client.add(
+            ("tasks", "tasklists", "list", "[('maxResults', 100)]"),
+            [
+                {
+                    "items": [
+                        {"id": "list-1", "title": "Personal"},
+                        {"id": "list-2", "title": "Work"},
+                    ]
+                }
+            ],
+        )
+        client.add(
+            (
+                "tasks",
+                "tasks",
+                "list",
+                "[('maxResults', 100), ('showAssigned', True), ('showCompleted', True), ('showDeleted', False), ('showHidden', False), ('tasklist', 'list-1')]",
+            ),
+            [
+                {
+                    "items": [
+                        {
+                            "id": "task-1",
+                            "title": "Buy milk",
+                            "status": "needsAction",
+                            "due": "2026-03-09T00:00:00.000Z",
+                            "updated": "2026-03-07T10:00:00.000Z",
+                        }
+                    ]
+                }
+            ],
+        )
+        client.add(
+            (
+                "tasks",
+                "tasks",
+                "list",
+                "[('maxResults', 100), ('showAssigned', True), ('showCompleted', True), ('showDeleted', False), ('showHidden', False), ('tasklist', 'list-2')]",
+            ),
+            [
+                {
+                    "items": [
+                        {
+                            "id": "task-2",
+                            "title": "Finish report",
+                            "status": "completed",
+                            "updated": "2026-03-08T10:00:00.000Z",
+                        }
+                    ]
+                }
+            ],
+        )
+
+        records = module.fetch_records(client)  # type: ignore[arg-type]
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0].title, "Buy milk")
+        self.assertEqual(records[0].subtitle, "Personal")
+        self.assertEqual(records[0].raw["tasklist_id"], "list-1")
+        self.assertEqual(records[1].title, "Finish report")
+        self.assertEqual(records[1].subtitle, "Work")
+
+    def test_fetch_records_respects_selected_tasklist(self) -> None:
+        client = StubClient()
+        module = TasksModule()
+        module.set_tasklist("list-2", "Work")
+        client.add(
+            ("tasks", "tasklists", "list", "[('maxResults', 100)]"),
+            [
+                {
+                    "items": [
+                        {"id": "list-1", "title": "Personal"},
+                        {"id": "list-2", "title": "Work"},
+                    ]
+                }
+            ],
+        )
+        client.add(
+            (
+                "tasks",
+                "tasks",
+                "list",
+                "[('maxResults', 100), ('showAssigned', True), ('showCompleted', True), ('showDeleted', False), ('showHidden', False), ('tasklist', 'list-2')]",
+            ),
+            [{"items": [{"id": "task-2", "title": "Finish report", "status": "needsAction"}]}],
+        )
+
+        records = module.fetch_records(client)  # type: ignore[arg-type]
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].subtitle, "Work")
+        self.assertEqual(module.list_label(), "Work")
+
+    def test_fetch_detail_reads_task(self) -> None:
+        client = StubClient()
+        module = TasksModule()
+        client.add(
+            ("tasks", "tasks", "get", "[('task', 'task-1'), ('tasklist', 'list-1')]"),
+            {
+                "id": "task-1",
+                "title": "Buy milk",
+                "status": "needsAction",
+                "due": "2026-03-09T00:00:00.000Z",
+                "updated": "2026-03-08T10:00:00.000Z",
+                "notes": "2% only",
+                "webViewLink": "https://tasks.google.com/task-1",
+            },
+        )
+
+        record = Record(
+            key="list-1:task-1",
+            columns=("Buy milk", "Personal", "Mar 09"),
+            title="Buy milk",
+            subtitle="Personal",
+            raw={"tasklist_id": "list-1", "task_id": "task-1", "tasklist_title": "Personal"},
+        )
+
+        detail = module.fetch_detail(client, record)
+
+        self.assertIn("Task Overview", detail)
+        self.assertIn("Task: Buy milk", detail)
+        self.assertIn("List: Personal", detail)
+        self.assertIn("2% only", detail)
+        self.assertIn("tasks.google.com", detail)
+
+    def test_create_task_uses_insert_endpoint(self) -> None:
+        client = StubClient()
+        module = TasksModule()
+        client.add(("tasks", "tasks", "insert", "[('tasklist', 'list-1')]"), {"id": "task-1"})
+
+        response = module.create_task(client, tasklist_id="list-1", title="Buy milk", notes="2% only", due_text="2026-03-09")  # type: ignore[arg-type]
+
+        self.assertEqual(response["id"], "task-1")
+        self.assertEqual(client.calls[-1][1], ("tasks", "insert"))
+        self.assertEqual(client.calls[-1][3]["title"], "Buy milk")
+        self.assertEqual(client.calls[-1][3]["notes"], "2% only")
+        self.assertEqual(client.calls[-1][3]["due"], "2026-03-09T00:00:00Z")
+
+    def test_update_task_status_uses_patch_endpoint(self) -> None:
+        client = StubClient()
+        module = TasksModule()
+        client.add(("tasks", "tasks", "patch", "[('task', 'task-1'), ('tasklist', 'list-1')]"), {"id": "task-1"})
+        record = Record(
+            key="list-1:task-1",
+            columns=("Buy milk", "Personal", "Mar 09"),
+            title="Buy milk",
+            subtitle="Personal",
+            raw={"task": {"status": "needsAction"}, "tasklist_id": "list-1", "task_id": "task-1", "completed": False},
+        )
+
+        response = module.update_task_status(client, record, completed=True)  # type: ignore[arg-type]
+
+        self.assertEqual(response["id"], "task-1")
+        self.assertEqual(client.calls[-1][1], ("tasks", "patch"))
+        self.assertEqual(client.calls[-1][3]["status"], "completed")
+        self.assertIn("completed", client.calls[-1][3])
+        self.assertTrue(record.raw["completed"])
 
 
 if __name__ == "__main__":
