@@ -2192,7 +2192,7 @@ class Workspace(App):
         border: round #3a3a3a;
     }
 
-    #sheet-edit-modal {
+    #doc-edit-modal, #sheet-edit-modal {
         width: 118;
         height: 88%;
         max-width: 96%;
@@ -2229,7 +2229,7 @@ class Workspace(App):
         margin-bottom: 1;
     }
 
-    #sheet-edit-body {
+    #doc-edit-body, #sheet-edit-body {
         height: 1fr;
     }
 
