@@ -37,10 +37,10 @@ class StubClient:
 
 
 class BuiltInModulesTest(unittest.TestCase):
-    def test_tasks_is_module_three(self) -> None:
+    def test_today_is_module_one(self) -> None:
         modules = built_in_modules()
 
-        self.assertEqual([module.id for module in modules], ["gmail", "calendar", "tasks", "drive", "sheets", "docs"])
+        self.assertEqual([module.id for module in modules], ["today", "gmail", "calendar", "tasks", "drive", "sheets", "docs"])
 
 
 class CalendarModuleTest(unittest.TestCase):

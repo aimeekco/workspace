@@ -13,6 +13,7 @@ from rich.panel import Panel
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Container, Horizontal, ScrollableContainer
 from textual.coordinate import Coordinate
 from textual.events import Key
@@ -28,9 +29,12 @@ from gws_tui.modules.docs import DocsModule
 from gws_tui.modules.gmail import GmailModule
 from gws_tui.modules.sheets import SheetsModule
 from gws_tui.modules.tasks import TasksModule
+from gws_tui.modules.today import SECTION_LABELS, SECTION_ORDER, TodayDashboard, TodayModule
 from gws_tui.profiles import GwsProfile, GwsProfileDiagnostic, discover_profiles, inspect_profile, inspect_profile_local
+from gws_tui.planner import task_create_defaults
 
 MODULE_ACCENTS = {
+    "today": "#d9a441",
     "gmail": "#88c0d0",
     "calendar": "#a3be8c",
     "tasks": "#d08770",
@@ -1203,6 +1207,221 @@ class ModuleView(PassiveScrollableContainer):
         self.loaded = False
 
 
+class TodayView(PassiveScrollableContainer):
+    """Gemini-powered workspace dashboard."""
+
+    module: TodayModule
+
+    def __init__(self, module: TodayModule, client: GwsClient) -> None:
+        super().__init__(id=f"view-{module.id}")
+        self.module = module
+        self.client = client
+        self.section_records: dict[str, list[Record]] = {}
+        self.records: dict[str, Record] = {}
+        self.current_key: str | None = None
+        self.current_section = SECTION_ORDER[0]
+        self.detail_label = "Preview"
+        self.loaded = False
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="module-heading"):
+            yield Static(self.module.title, id="title-today", classes="module-title")
+            yield Static(self.module.badge(), id="badge-today", classes="module-badge")
+        with Horizontal(classes="module-body"):
+            with Container(id="pane-sections-today", classes="pane pane-mailboxes"):
+                yield Static("Sections", classes="pane-title")
+                yield ListView(id="section-list-today")
+            with Container(classes="pane pane-mail"):
+                yield Static(SECTION_LABELS[self.current_section], id="section-heading-today", classes="pane-title")
+                yield DataTable(id="table-today")
+            with Container(classes="pane pane-mail-detail"):
+                yield Static("Preview", id="detail-label-today", classes="pane-title")
+                with FocusableScrollableContainer(classes="detail-container"):
+                    yield Static("Select a section to inspect today's briefing.", id="detail-today")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#table-today", DataTable)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_column("Item", width=38)
+        table.add_column("Source", width=18)
+        table.add_column("When", width=18)
+        table.show_header = True
+
+    def load_if_needed(self) -> None:
+        if not self.loaded:
+            self.action_refresh()
+
+    def action_refresh(self) -> None:
+        self.loaded = True
+        self.detail_label = "Preview"
+        self._set_detail_label("Preview")
+        self._set_detail_text(self._state_text("Loading Today", self.module.loading_message()))
+        self.app.update_status("Loading today...")
+        self._load_dashboard(False)
+
+    def action_regenerate(self) -> None:
+        self.loaded = True
+        self.detail_label = "Preview"
+        self._set_detail_label("Preview")
+        self._set_detail_text(self._state_text("Refreshing Today", "Ignoring the cache and rebuilding the daily brief..."))
+        self.app.update_status("Regenerating today...")
+        self._load_dashboard(True)
+
+    @work(thread=True, exclusive=True)
+    def _load_dashboard(self, force_refresh: bool) -> None:
+        try:
+            dashboard = self.module.fetch_dashboard(self.client, force_refresh=force_refresh)
+        except GwsError as exc:
+            self.app.call_from_thread(self._handle_error, exc.message)
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.app.call_from_thread(self._handle_error, str(exc))
+            return
+        self.app.call_from_thread(self._render_dashboard, dashboard)
+
+    def _render_dashboard(self, dashboard: TodayDashboard) -> None:
+        self.section_records = {section: list(dashboard.section_records.get(section, [])) for section in SECTION_ORDER}
+        self._render_sections()
+        self._render_section_records()
+        self.app.refresh_bindings()
+        warnings = f", {len(dashboard.warnings)} warnings" if dashboard.warnings else ""
+        self.app.update_status(f"Today: loaded from {dashboard.source}{warnings}")
+
+    def _render_sections(self) -> None:
+        section_list = self.query_one("#section-list-today", ListView)
+        section_list.clear()
+        selected_index = 0
+        for index, section in enumerate(SECTION_ORDER):
+            count = len(self.section_records.get(section, []))
+            label = f"{SECTION_LABELS[section]} ({count})"
+            section_list.append(ListItem(Static(label), name=section))
+            if section == self.current_section:
+                selected_index = index
+        section_list.index = selected_index
+        self._apply_section_width()
+
+    def _apply_section_width(self) -> None:
+        longest = max([len("Sections"), *(len(f"{SECTION_LABELS[section]} ({len(self.section_records.get(section, []))})") for section in SECTION_ORDER)], default=len("Sections"))
+        self.query_one("#pane-sections-today", Container).styles.width = max(18, longest + 4)
+
+    def _render_section_records(self) -> None:
+        self.query_one("#section-heading-today", Static).update(SECTION_LABELS[self.current_section])
+        records = self.section_records.get(self.current_section, [])
+        self.records = {record.key: record for record in records}
+        table = self.query_one("#table-today", DataTable)
+        table.clear()
+        if not records:
+            self.current_key = None
+            self._set_detail_label("Preview")
+            self._set_detail_text(self._state_text("No items", f"{SECTION_LABELS[self.current_section]} is empty."))
+            self.app.refresh_bindings()
+            return
+        for record in records:
+            table.add_row(*record.columns, key=record.key)
+        table.move_cursor(row=0, column=0)
+        self.show_preview(records[0].key)
+
+    def show_preview(self, key: str) -> None:
+        if key not in self.records:
+            return
+        self.current_key = key
+        record = self.records[key]
+        self._set_detail_label("Preview")
+        self._set_detail_text(record.preview or record.title)
+        self.app.refresh_bindings()
+        self.app.update_status(f"Today: previewing {record.title}")
+
+    def open_record(self, key: str) -> None:
+        if key not in self.records:
+            return
+        self.current_key = key
+        record = self.records[key]
+        self._set_detail_label("Detail")
+        self._set_detail_text(str(record.raw.get("detail", record.preview or record.title)))
+        self.app.refresh_bindings()
+        self.app.update_status(f"Today: {record.title}")
+
+    def current_record(self) -> Record | None:
+        if self.current_key is None:
+            return None
+        return self.records.get(self.current_key)
+
+    def current_draft_id(self) -> str | None:
+        record = self.current_record()
+        if record is None:
+            return None
+        draft_id = record.raw.get("draft_id")
+        return str(draft_id) if draft_id else None
+
+    def sync_from_module(self) -> None:
+        dashboard = self.module.current_dashboard
+        if dashboard is None:
+            self.action_refresh()
+            return
+        self._render_dashboard(dashboard)
+
+    def _set_detail_label(self, value: str) -> None:
+        self.detail_label = value
+        self.query_one("#detail-label-today", Static).update(value)
+
+    def _set_detail_text(self, value: str) -> None:
+        self.query_one("#detail-today", Static).update(
+            Panel(Text(value), title=self.module.title, subtitle=self.detail_label, border_style=MODULE_ACCENTS["today"], box=box.ROUNDED)
+        )
+
+    def _state_text(self, heading: str, message: str, hint: str = "") -> str:
+        lines = [heading, "", message]
+        if hint:
+            lines.extend(["", hint])
+        return "\n".join(lines)
+
+    def _handle_error(self, message: str) -> None:
+        self.records = {}
+        self.current_key = None
+        self._set_detail_label("Preview")
+        self._set_detail_text(self._state_text("Today request failed", message))
+        table = self.query_one("#table-today", DataTable)
+        table.clear()
+        self.app.update_status("Today: request failed")
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id != "table-today" or event.row_key is None:
+            return
+        self.show_preview(str(event.row_key.value))
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "table-today" or event.row_key is None:
+            return
+        self.open_record(str(event.row_key.value))
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.list_view.id != "section-list-today" or event.item is None:
+            return
+        section = event.item.name or self.current_section
+        if section == self.current_section:
+            return
+        self.current_section = section
+        self._render_section_records()
+
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        if event.list_view.id != "section-list-today" or event.item is None:
+            return
+        section = event.item.name or self.current_section
+        if section == self.current_section:
+            return
+        self.current_section = section
+        self._render_section_records()
+
+    def reset_state(self) -> None:
+        self.section_records = {}
+        self.records = {}
+        self.current_key = None
+        self.current_section = SECTION_ORDER[0]
+        self.detail_label = "Preview"
+        self.loaded = False
+
+
 class GmailView(PassiveScrollableContainer):
     """Gmail-specific three-pane layout with mailbox selector."""
 
@@ -2083,21 +2302,24 @@ class Workspace(App):
 
     BINDINGS = [
         ("q", "quit", "Quit"),
-        ("r", "refresh", "Refresh"),
+        Binding("r", "refresh", "Refresh"),
+        Binding("r", "regenerate_today", "Regen"),
         ("a", "add_event", "Add"),
         ("c", "compose_email", "Compose"),
-        ("d", "delete_email", "Trash"),
+        ("d", "delete_email", "Delete"),
+        Binding("D", "reject_today_draft", "Reject", key_display="Shift+D"),
         ("e", "reply_email", "Reply"),
-        ("shift+e", "reply_all_email", "Reply All"),
+        Binding("E", "reply_all_email", "Reply All", key_display="Shift+E"),
         ("f", "forward_email", "Forward"),
         ("l", "edit_labels", "Labels"),
         ("n", "create_doc", "New Doc"),
-        ("p", "switch_profile", "Profiles"),
+        ("p", "switch_profile", "Profile"),
         ("/", "search_email", "Search"),
+        Binding("A", "approve_today_draft", "Approve", key_display="Shift+A"),
         ("u", "toggle_unread_filter", "Unread"),
-        ("x", "toggle_task_complete", "Toggle Task"),
-        ("[", "previous_calendar_month", "Prev Month"),
-        ("]", "next_calendar_month", "Next Month"),
+        ("x", "toggle_task_complete", "Toggle"),
+        ("[", "previous_calendar_month", "Prev Mon"),
+        ("]", "next_calendar_month", "Next Mon"),
         ("tab", "next_module", "Next"),
         ("shift+tab", "previous_module", "Prev"),
         ("w", "edit_doc", "Edit"),
@@ -2116,8 +2338,9 @@ class Workspace(App):
             if self.current_profile is not None and not self.client.config_dir:
                 self.client.config_dir = self.current_profile.config_dir
         self.modules = built_in_modules()
-        self.module_views: dict[str, ModuleView] = {}
+        self.module_views: dict[str, object] = {}
         self.current_module_id = self.modules[0].id
+        self._sync_today_profile_name()
         self.prompt_for_profile_on_mount = (
             len(self.profiles) > 1
             and not os.environ.get("GWS_TUI_PROFILE", "").strip()
@@ -2139,7 +2362,9 @@ class Workspace(App):
                     )
                 with ContentSwitcher(initial=f"frame-{self.current_module_id}", id="content-switcher"):
                     for module in self.modules:
-                        if isinstance(module, CalendarModule):
+                        if isinstance(module, TodayModule):
+                            view = TodayView(module, self.client)
+                        elif isinstance(module, CalendarModule):
                             view = CalendarGridView(module, self.client)
                         elif isinstance(module, GmailModule):
                             view = GmailView(module, self.client)
@@ -2191,6 +2416,34 @@ class Workspace(App):
         status.append(message, style="#c8c8c8")
         self.query_one("#status", Static).update(status)
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "refresh":
+            return self.current_module_id != "today"
+        if action == "regenerate_today":
+            return self.current_module_id == "today"
+        if action == "add_event":
+            return self.current_module_id in {"calendar", "tasks"}
+        if action in {"compose_email", "reply_email", "reply_all_email", "forward_email", "edit_labels", "search_email", "toggle_unread_filter"}:
+            return self.current_module_id == "gmail"
+        if action == "delete_email":
+            return self.current_module_id in {"gmail", "calendar"}
+        if action == "create_doc":
+            return self.current_module_id == "docs"
+        if action == "edit_doc":
+            return self.current_module_id in {"docs", "sheets"}
+        if action == "toggle_task_complete":
+            return self.current_module_id == "tasks"
+        if action in {"previous_calendar_month", "next_calendar_month"}:
+            return self.current_module_id == "calendar"
+        if action in {"approve_today_draft", "reject_today_draft"}:
+            if self.current_module_id != "today":
+                return False
+            today_view = self.module_views.get("today")
+            if not isinstance(today_view, TodayView):
+                return False
+            return True if today_view.current_draft_id() else None
+        return True
+
     def _on_gws_event(self, event: GwsCommandEvent) -> None:
         self.call_from_thread(self._record_gws_event, event)
 
@@ -2222,7 +2475,52 @@ class Workspace(App):
         return "#88c0d0"
 
     def action_refresh(self) -> None:
+        if self.current_module_id == "today":
+            self.action_regenerate_today()
+            return
         self.module_views[self.current_module_id].action_refresh()
+
+    def action_regenerate_today(self) -> None:
+        today_view = self.module_views.get("today")
+        if self.current_module_id != "today" or not isinstance(today_view, TodayView):
+            self.update_status("Regenerate is only available in Today")
+            return
+        today_view.action_regenerate()
+
+    def action_approve_today_draft(self) -> None:
+        today_module = self._current_today_module()
+        today_view = self.module_views.get("today")
+        if today_module is None or not isinstance(today_view, TodayView):
+            self.update_status("Approve draft is only available in Today")
+            return
+        draft_id = today_view.current_draft_id()
+        if not draft_id:
+            self.update_status("Approve draft: select a draft in Today")
+            return
+        draft = today_module.draft_by_id(draft_id)
+        if draft is None:
+            self.update_status("Approve draft: draft no longer exists")
+            return
+        self.update_status(f"Applying draft: {draft.title}")
+        self._apply_today_draft(today_module, draft_id)
+
+    def action_reject_today_draft(self) -> None:
+        today_module = self._current_today_module()
+        today_view = self.module_views.get("today")
+        if today_module is None or not isinstance(today_view, TodayView):
+            self.update_status("Reject draft is only available in Today")
+            return
+        draft_id = today_view.current_draft_id()
+        if not draft_id:
+            self.update_status("Reject draft: select a draft in Today")
+            return
+        draft = today_module.draft_by_id(draft_id)
+        if draft is None:
+            self.update_status("Reject draft: draft no longer exists")
+            return
+        today_module.remove_draft(draft_id)
+        today_view.sync_from_module()
+        self.update_status(f"Draft rejected: {draft.title}")
 
     def action_add_event(self) -> None:
         tasks_module = self._current_tasks_module()
@@ -2456,6 +2754,7 @@ class Workspace(App):
     def _show_module(self, module_id: str) -> None:
         self.current_module_id = module_id
         self.query_one(ContentSwitcher).current = f"frame-{module_id}"
+        self.refresh_bindings()
         self.module_views[module_id].load_if_needed()
 
     @property
@@ -2467,6 +2766,12 @@ class Workspace(App):
     def _current_calendar_module(self) -> CalendarModule | None:
         for module in self.modules:
             if module.id == self.current_module_id and isinstance(module, CalendarModule):
+                return module
+        return None
+
+    def _current_today_module(self) -> TodayModule | None:
+        for module in self.modules:
+            if module.id == self.current_module_id and isinstance(module, TodayModule):
                 return module
         return None
 
@@ -2527,6 +2832,7 @@ class Workspace(App):
         self.current_profile_name = profile.name
         if isinstance(self.client, GwsClient):
             self.client.config_dir = profile.config_dir
+        self._sync_today_profile_name()
         self.activity_lines.clear()
         self.query_one("#activity-log", Static).update("")
         self._refresh_profile_label()
@@ -2542,6 +2848,11 @@ class Workspace(App):
         if self.current_profile_name:
             label = f"gws activity · {self.current_profile_name}"
         self.query_one("#activity-label", Static).update(label)
+
+    def _sync_today_profile_name(self) -> None:
+        for module in self.modules:
+            if isinstance(module, TodayModule):
+                module.set_profile_name(self.current_profile_name)
 
     def _profile_diagnostics_snapshot(self) -> dict[str, GwsProfileDiagnostic]:
         diagnostics: dict[str, GwsProfileDiagnostic] = {}
@@ -2952,6 +3263,113 @@ class Workspace(App):
             return
         self.call_from_thread(self.update_status, "Sheet saved")
         self.call_from_thread(self.module_views["sheets"].action_refresh)
+
+    @work(thread=True, exclusive=True)
+    def _apply_today_draft(self, today_module: TodayModule, draft_id: str) -> None:
+        draft = today_module.draft_by_id(draft_id)
+        if draft is None:
+            self.call_from_thread(self.update_status, "Draft apply failed: draft no longer exists")
+            return
+        try:
+            if draft.kind == "task_create":
+                tasks_module = next((module for module in self.modules if isinstance(module, TasksModule)), None)
+                if tasks_module is None:
+                    raise ValueError("Tasks module unavailable")
+                if not tasks_module.default_create_tasklist_id():
+                    tasks_module.tasklist_options(self.client)
+                tasklist_id = str(draft.payload.get("tasklist_id", "") or tasks_module.default_create_tasklist_id()).strip()
+                if not tasklist_id:
+                    raise ValueError("No writable task list available")
+                title, notes, due_text = task_create_defaults(draft, today_module.current_context)
+                if not title:
+                    raise ValueError("Task title is required")
+                tasks_module.create_task(
+                    self.client,
+                    tasklist_id=tasklist_id,
+                    title=title,
+                    notes=notes,
+                    due_text=due_text,
+                )
+                target_module_id = "tasks"
+                success_message = "Draft applied: task created"
+            elif draft.kind == "calendar_event_create":
+                calendar_module = next((module for module in self.modules if isinstance(module, CalendarModule)), None)
+                if calendar_module is None:
+                    raise ValueError("Calendar module unavailable")
+                summary = str(draft.payload.get("summary", "") or draft.title).strip()
+                start_text = str(draft.payload.get("start", "") or draft.payload.get("start_text", "")).strip()
+                end_text = str(draft.payload.get("end", "") or draft.payload.get("end_text", "")).strip()
+                duration_text = str(draft.payload.get("duration", "") or draft.payload.get("duration_text", "")).strip()
+                if not summary or not start_text:
+                    raise ValueError("Calendar draft requires summary and start time")
+                calendar_module.add_event(
+                    self.client,
+                    calendar_id=str(draft.payload.get("calendar_id", "") or "primary").strip(),
+                    summary=summary,
+                    start_text=start_text,
+                    end_text=end_text,
+                    duration_text=duration_text,
+                    location=str(draft.payload.get("location", "")).strip(),
+                    description=str(draft.payload.get("description", "") or draft.detail).strip(),
+                )
+                target_module_id = "calendar"
+                success_message = "Draft applied: calendar event created"
+            elif draft.kind == "doc_create":
+                docs_module = next((module for module in self.modules if isinstance(module, DocsModule)), None)
+                if docs_module is None:
+                    raise ValueError("Docs module unavailable")
+                title = str(draft.payload.get("title", "") or draft.title).strip()
+                if not title:
+                    raise ValueError("Document title is required")
+                docs_module.create_document(
+                    self.client,
+                    title=title,
+                    body=str(draft.payload.get("body", "") or draft.detail).strip(),
+                )
+                target_module_id = "docs"
+                success_message = "Draft applied: document created"
+            elif draft.kind == "gmail_draft":
+                gmail_module = next((module for module in self.modules if isinstance(module, GmailModule)), None)
+                if gmail_module is None:
+                    raise ValueError("Gmail module unavailable")
+                to = str(draft.payload.get("to", "")).strip()
+                subject = str(draft.payload.get("subject", "") or draft.title).strip()
+                body = str(draft.payload.get("body", "") or draft.detail).strip()
+                if not to or not subject or not body:
+                    raise ValueError("Gmail draft requires to, subject, and body")
+                gmail_module.create_draft(
+                    self.client,
+                    to=to,
+                    cc=str(draft.payload.get("cc", "")).strip(),
+                    subject=subject,
+                    body=body,
+                    attachment_paths=[],
+                )
+                target_module_id = "gmail"
+                success_message = "Draft applied: Gmail draft saved"
+            else:
+                raise ValueError(f"Unsupported draft type: {draft.kind}")
+        except (FileNotFoundError, ValueError) as exc:
+            self.call_from_thread(self.update_status, f"Draft apply failed: {exc}")
+            return
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Draft apply failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Draft apply failed: {exc}")
+            return
+
+        today_module.remove_draft(draft_id)
+        self.call_from_thread(self._after_today_draft_applied, target_module_id, success_message)
+
+    def _after_today_draft_applied(self, target_module_id: str, message: str) -> None:
+        today_view = self.module_views.get("today")
+        if isinstance(today_view, TodayView):
+            today_view.sync_from_module()
+        target_view = self.module_views.get(target_module_id)
+        if target_view is not None and getattr(target_view, "loaded", False):
+            target_view.action_refresh()
+        self.update_status(message)
 
     @work(thread=True, exclusive=True)
     def _send_email(

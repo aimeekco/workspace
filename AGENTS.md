@@ -7,12 +7,13 @@
 - Architecture: one shared app shell with module-specific views and module-specific `gws` adapters
 
 ## Module Order
-- `1` Gmail
-- `2` Calendar
-- `3` Tasks
-- `4` Drive
-- `5` Sheets
-- `6` Docs
+- `1` Today
+- `2` Gmail
+- `3` Calendar
+- `4` Tasks
+- `5` Drive
+- `6` Sheets
+- `7` Docs
 
 Keep this order aligned with:
 - `gws_tui/modules/__init__.py`
@@ -48,6 +49,12 @@ Keep this order aligned with:
   - Docs: create doc
 - `w`
   - Docs / Sheets: edit
+- `r`
+  - Today: regenerate briefing
+- `Shift+A`
+  - Today: approve selected draft
+- `Shift+D`
+  - Today: reject selected draft
 - `p`
   - switch profiles
 - `/`
@@ -58,6 +65,11 @@ Keep this order aligned with:
   - Calendar month navigation
 
 ## Module Notes
+
+### Today
+- New workspace-wide daily briefing powered by Gemini or a heuristic fallback
+- Focuses on unread Gmail, today's calendar, open tasks, and recent files/docs/sheets
+- Maintains a Today-pane draft queue for approval-only actions
 
 ### Gmail
 - Uses a dedicated three-pane view

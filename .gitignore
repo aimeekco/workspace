@@ -3,3 +3,5 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 .gws_tui_profiles.json
+.gws_tui_today_cache.json
+.env
