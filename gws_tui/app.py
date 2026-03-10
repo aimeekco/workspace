@@ -26,7 +26,7 @@ from gws_tui.modules import WorkspaceModule, built_in_modules
 from gws_tui.modules.calendar import CalendarModule
 from gws_tui.modules.drive import DriveModule
 from gws_tui.modules.docs import DocsModule
-from gws_tui.modules.gmail import GmailModule
+from gws_tui.modules.gmail import GmailDetail, GmailModule
 from gws_tui.modules.sheets import SheetsModule
 from gws_tui.modules.tasks import TasksModule
 from gws_tui.modules.today import SECTION_LABELS, SECTION_ORDER, TodayDashboard, TodayModule
@@ -257,20 +257,21 @@ class ProfilePickerScreen(ModalScreen[str | None]):
 
 
 class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
-    """Compose a plain text email."""
+    """Compose a Gmail message."""
 
     BINDINGS = [("escape", "cancel", "Cancel")]
 
     def __init__(
         self,
         title: str = "Compose Email",
-        subtitle: str = "Send a plain text Gmail message.",
+        subtitle: str = "Send a Gmail message. Optional HTML supports links and basic formatting.",
         submit_label: str = "Send",
         initial_to: str = "",
         initial_cc: str = "",
         initial_subject: str = "",
         initial_body: str = "",
         initial_attachments: str = "",
+        initial_body_format: str = "plain",
     ) -> None:
         super().__init__()
         self.title = title
@@ -281,6 +282,7 @@ class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
         self.initial_subject = initial_subject
         self.initial_body = initial_body
         self.initial_attachments = initial_attachments
+        self.initial_body_format = initial_body_format
 
     def compose(self) -> ComposeResult:
         with Container(id="compose-modal", classes="modal-window"):
@@ -293,6 +295,11 @@ class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
                 value=self.initial_attachments,
                 placeholder="Optional attachments: /path/file.pdf, /path/image.png",
                 id="compose-attachments",
+            )
+            yield Checkbox(
+                "HTML body (`<a>`, `<b>`, `<i>`, `<p>`, `<br>`, `<ul>`, `<ol>`, `<code>`)",
+                value=self.initial_body_format == "html",
+                id="compose-html",
             )
             yield TextArea(self.initial_body, id="compose-body")
             with Horizontal(classes="modal-actions"):
@@ -316,6 +323,7 @@ class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
         cc = self.query_one("#compose-cc", Input).value.strip()
         subject = self.query_one("#compose-subject", Input).value.strip()
         attachment_text = self.query_one("#compose-attachments", Input).value.strip()
+        body_format = "html" if self.query_one("#compose-html", Checkbox).value else "plain"
         body = self.query_one("#compose-body", TextArea).text.strip()
         is_send = event.button.id == "compose-send"
         if is_send and not to:
@@ -338,6 +346,7 @@ class ComposeEmailScreen(ModalScreen[dict[str, str] | None]):
                 "subject": subject,
                 "body": body,
                 "attachments": attachment_text,
+                "body_format": body_format,
             }
         )
 
@@ -629,6 +638,69 @@ class GmailSearchScreen(ModalScreen[str | None]):
             return
         query = self.query_one("#gmail-search-query", Input).value.strip()
         self.dismiss(query)
+
+
+class LinkPickerScreen(ModalScreen[dict[str, str] | None]):
+    """Choose a link from the selected Gmail message."""
+
+    BINDINGS = [("escape", "cancel", "Cancel"), ("enter", "open_selected", "Open")]
+
+    def __init__(self, links: list[str]) -> None:
+        super().__init__()
+        self.links = links
+
+    def compose(self) -> ComposeResult:
+        with Container(id="links-modal", classes="modal-window"):
+            yield Static("Open Gmail Link", classes="modal-title")
+            yield Static("Select a link to open or copy.", classes="modal-subtitle")
+            yield ListView(
+                *(ListItem(Static(link), name=link) for link in self.links),
+                id="links-list",
+            )
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel", id="links-cancel")
+                yield Button("Copy", id="links-copy")
+                yield Button("Open", variant="primary", id="links-open")
+
+    def on_mount(self) -> None:
+        link_list = self.query_one("#links-list", ListView)
+        link_list.index = 0
+        link_list.focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_open_selected(self) -> None:
+        selected = self._selected_link()
+        if selected is None:
+            self.dismiss(None)
+            return
+        self.dismiss({"action": "open", "url": selected})
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "links-cancel":
+            self.dismiss(None)
+            return
+        selected = self._selected_link()
+        if selected is None:
+            self.dismiss(None)
+            return
+        if event.button.id == "links-copy":
+            self.dismiss({"action": "copy", "url": selected})
+            return
+        if event.button.id == "links-open":
+            self.dismiss({"action": "open", "url": selected})
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.list_view.id != "links-list":
+            return
+        self.action_open_selected()
+
+    def _selected_link(self) -> str | None:
+        link_list = self.query_one("#links-list", ListView)
+        if link_list.index is None or not self.links:
+            return None
+        return self.links[link_list.index]
 
 
 class CreateDocumentScreen(ModalScreen[dict[str, str] | None]):
@@ -1431,7 +1503,7 @@ class GmailView(PassiveScrollableContainer):
         self.client = client
         self.records: dict[str, Record] = {}
         self.current_key: str | None = None
-        self.detail_cache: dict[str, str] = {}
+        self.detail_cache: dict[str, GmailDetail] = {}
         self.detail_label = "Preview"
         self.loaded = False
 
@@ -1492,7 +1564,7 @@ class GmailView(PassiveScrollableContainer):
     def _load_detail(self, key: str) -> None:
         record = self.records[key]
         try:
-            detail = self.module.fetch_detail(self.client, record)
+            detail = self.module.fetch_detail_content(self.client, record)
         except GwsError as exc:
             self.app.call_from_thread(self._set_detail_text, self._state_text("Gmail detail failed", exc.message))
             self.app.call_from_thread(self.app.update_status, "Gmail request failed")
@@ -1576,10 +1648,10 @@ class GmailView(PassiveScrollableContainer):
         self.app.update_status("Loading gmail detail...")
         self._load_detail(key)
 
-    def _render_detail(self, detail: str) -> None:
+    def _render_detail(self, detail: GmailDetail) -> None:
         self.query_one("#detail-gmail", Static).update(
             Panel(
-                Text(detail),
+                detail.renderable,
                 title=self.module.title,
                 subtitle=self.detail_label,
                 border_style=MODULE_ACCENTS["gmail"],
@@ -2313,6 +2385,7 @@ class Workspace(App):
         ("f", "forward_email", "Forward"),
         ("l", "edit_labels", "Labels"),
         ("n", "create_doc", "New Doc"),
+        ("o", "open_email_link", "Open Link"),
         ("p", "switch_profile", "Profile"),
         ("/", "search_email", "Search"),
         Binding("A", "approve_today_draft", "Approve", key_display="Shift+A"),
@@ -2423,7 +2496,7 @@ class Workspace(App):
             return self.current_module_id == "today"
         if action == "add_event":
             return self.current_module_id in {"calendar", "tasks"}
-        if action in {"compose_email", "reply_email", "reply_all_email", "forward_email", "edit_labels", "search_email", "toggle_unread_filter"}:
+        if action in {"compose_email", "reply_email", "reply_all_email", "forward_email", "edit_labels", "search_email", "toggle_unread_filter", "open_email_link"}:
             return self.current_module_id == "gmail"
         if action == "delete_email":
             return self.current_module_id in {"gmail", "calendar"}
@@ -2709,6 +2782,23 @@ class Workspace(App):
         current_label_ids = set(record.raw.get("label_ids", []))
         self._load_label_editor(gmail_module, record.key, record.title, current_label_ids)
 
+    def action_open_email_link(self) -> None:
+        gmail_module = self._current_gmail_module()
+        gmail_view = self.module_views.get("gmail")
+        if gmail_module is None or not isinstance(gmail_view, GmailView):
+            self.update_status("Open link is only available in Gmail")
+            return
+        record = gmail_view.current_record()
+        if record is None:
+            self.update_status("Open link: no email selected")
+            return
+        detail = gmail_view.detail_cache.get(record.key)
+        if detail is not None:
+            self._present_email_links(detail)
+            return
+        self.update_status("Loading email links...")
+        self._load_email_links(gmail_module, gmail_view, record)
+
     def action_next_module(self) -> None:
         module_list = self.query_one(ListView)
         if module_list.index is None:
@@ -2909,6 +2999,34 @@ class Workspace(App):
             result["description"],
         )
 
+    def _present_email_links(self, detail: GmailDetail) -> None:
+        if not detail.links:
+            self.update_status("Open link: no links found in this email")
+            return
+        if len(detail.links) == 1:
+            self._handle_link_result({"action": "open", "url": detail.links[0]})
+            return
+        self.push_screen(LinkPickerScreen(detail.links), self._handle_link_result)
+
+    def _handle_link_result(self, result: dict[str, str] | None) -> None:
+        if result is None:
+            self.update_status("Open link cancelled")
+            return
+        url = result.get("url", "").strip()
+        if not url:
+            self.update_status("Open link failed: missing URL")
+            return
+        if result.get("action") == "copy":
+            self.copy_to_clipboard(url)
+            self.update_status(f"Copied link: {url}")
+            return
+        try:
+            self.open_url(url)
+        except Exception as exc:  # noqa: BLE001
+            self.update_status(f"Open link failed: {exc}")
+            return
+        self.update_status(f"Opened link: {url}")
+
     def _handle_calendar_delete_result(self, event_key: str | None, records: dict[str, Record]) -> None:
         if event_key is None:
             self.update_status("Delete event cancelled")
@@ -2939,6 +3057,7 @@ class Workspace(App):
                 subject=result["subject"],
                 body=result["body"],
                 attachment_paths=attachment_paths,
+                body_format=result.get("body_format", "plain"),
             )
             return
         self.update_status("Sending email...")
@@ -2949,6 +3068,7 @@ class Workspace(App):
             result["subject"],
             result["body"],
             attachment_paths,
+            result.get("body_format", "plain"),
         )
 
     def _handle_search_result(self, result: str | None) -> None:
@@ -3034,6 +3154,7 @@ class Workspace(App):
                 thread_id=reply_context["thread_id"],
                 in_reply_to=reply_context["in_reply_to"],
                 references=reply_context["references"],
+                body_format=result.get("body_format", "plain"),
             )
             return
         self.update_status("Sending reply...")
@@ -3047,6 +3168,7 @@ class Workspace(App):
             thread_id=reply_context["thread_id"],
             in_reply_to=reply_context["in_reply_to"],
             references=reply_context["references"],
+            body_format=result.get("body_format", "plain"),
         )
 
     def _parse_attachment_paths(self, value: str) -> list[str]:
@@ -3122,6 +3244,23 @@ class Workspace(App):
             return
         self.call_from_thread(self.update_status, "Calendar event created")
         self.call_from_thread(self.module_views["calendar"].action_refresh)
+
+    @work(thread=True, exclusive=True)
+    def _load_email_links(self, gmail_module: GmailModule, gmail_view: GmailView, record: Record) -> None:
+        try:
+            detail = gmail_module.fetch_detail_content(self.client, record)
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Open link failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Open link failed: {exc}")
+            return
+        self.call_from_thread(self._finish_loading_email_links, gmail_view, record.key, detail)
+
+    def _finish_loading_email_links(self, gmail_view: GmailView, record_key: str, detail: GmailDetail) -> None:
+        gmail_view.detail_cache[record_key] = detail
+        gmail_view._refresh_row(record_key)
+        self._present_email_links(detail)
 
     @work(thread=True, exclusive=True)
     def _delete_calendar_event(self, calendar_module: CalendarModule, record: Record) -> None:
@@ -3344,6 +3483,7 @@ class Workspace(App):
                     subject=subject,
                     body=body,
                     attachment_paths=[],
+                    body_format=str(draft.payload.get("body_format", "plain")).strip() or "plain",
                 )
                 target_module_id = "gmail"
                 success_message = "Draft applied: Gmail draft saved"
@@ -3380,6 +3520,7 @@ class Workspace(App):
         subject: str,
         body: str,
         attachment_paths: list[str],
+        body_format: str = "plain",
     ) -> None:
         try:
             gmail_module.send_message(
@@ -3389,6 +3530,7 @@ class Workspace(App):
                 subject=subject,
                 body=body,
                 attachment_paths=attachment_paths,
+                body_format=body_format,
             )
         except (FileNotFoundError, ValueError) as exc:
             self.call_from_thread(self.update_status, f"Send failed: {exc}")
@@ -3414,6 +3556,7 @@ class Workspace(App):
         thread_id: str = "",
         in_reply_to: str = "",
         references: str = "",
+        body_format: str = "plain",
     ) -> None:
         try:
             gmail_module.create_draft(
@@ -3426,6 +3569,7 @@ class Workspace(App):
                 thread_id=thread_id,
                 in_reply_to=in_reply_to,
                 references=references,
+                body_format=body_format,
             )
         except (FileNotFoundError, ValueError) as exc:
             self.call_from_thread(self.update_status, f"Draft failed: {exc}")
@@ -3529,6 +3673,7 @@ class Workspace(App):
         thread_id: str,
         in_reply_to: str,
         references: str,
+        body_format: str = "plain",
     ) -> None:
         try:
             gmail_module.reply_to_message(
@@ -3541,6 +3686,7 @@ class Workspace(App):
                 thread_id=thread_id,
                 in_reply_to=in_reply_to,
                 references=references,
+                body_format=body_format,
             )
         except (FileNotFoundError, ValueError) as exc:
             self.call_from_thread(self.update_status, f"Reply failed: {exc}")

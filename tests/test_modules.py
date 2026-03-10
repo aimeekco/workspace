@@ -11,7 +11,7 @@ from gws_tui.modules import built_in_modules
 from gws_tui.modules.calendar import CalendarModule, calendar_is_writable, event_day_keys, format_event_time, parse_duration
 from gws_tui.modules.drive import DriveModule, drive_kind
 from gws_tui.modules.docs import DocsModule, document_body_end_index, extract_document_text
-from gws_tui.modules.gmail import GmailModule, extract_body, format_message_date, normalize_forward_subject, normalize_reply_subject
+from gws_tui.modules.gmail import GmailModule, extract_body, extract_links, format_message_date, html_to_rich_text, normalize_forward_subject, normalize_reply_subject
 from gws_tui.modules.sheets import SheetsModule
 from gws_tui.modules.tasks import TasksModule
 
@@ -212,6 +212,14 @@ class GmailHelpersTest(unittest.TestCase):
 
         self.assertEqual(extract_body(payload), "Hello")
 
+    def test_extract_body_falls_back_to_html(self) -> None:
+        payload = {
+            "mimeType": "text/html",
+            "body": {"data": "PHA+SGkgPGEgaHJlZj0iaHR0cHM6Ly9leGFtcGxlLmNvbSI+ZXhhbXBsZTwvYT48L3A+"},
+        }
+
+        self.assertEqual(extract_body(payload), "Hi example (https://example.com)")
+
     def test_format_message_date_falls_back(self) -> None:
         self.assertEqual(format_message_date(""), "Unknown date")
 
@@ -223,6 +231,18 @@ class GmailHelpersTest(unittest.TestCase):
         text = raw_bytes.decode("utf-8")
         self.assertIn("To: to@example.com", text)
         self.assertIn("Subject: Hello", text)
+        self.assertIn("Body text", text)
+
+    def test_build_raw_message_supports_html_body(self) -> None:
+        module = GmailModule()
+
+        raw = module.build_raw_message("to@example.com", "Hello", "<p>Body <b>text</b></p>", body_format="html")
+        raw_bytes = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+        text = raw_bytes.decode("utf-8")
+
+        self.assertIn("multipart/alternative", text)
+        self.assertIn("Content-Type: text/html", text)
+        self.assertIn("<p>Body <b>text</b></p>", text)
         self.assertIn("Body text", text)
 
     def test_build_raw_message_contains_cc(self) -> None:
@@ -276,6 +296,17 @@ class GmailHelpersTest(unittest.TestCase):
         self.assertIn("References: <prev@example.com> <message-id@example.com>", text)
         self.assertIn("Cc: team@example.com", text)
         self.assertIn("Reply body", text)
+
+    def test_html_to_rich_text_keeps_link_spans(self) -> None:
+        rich_text = html_to_rich_text('<p>Visit <a href="https://example.com">example</a></p>')
+
+        self.assertEqual(rich_text.plain.strip(), "Visit example")
+        self.assertTrue(any("link https://example.com" in str(span.style) for span in rich_text.spans))
+
+    def test_extract_links_deduplicates_and_trims_punctuation(self) -> None:
+        links = extract_links("See https://example.com, https://example.com and https://two.example/path).")
+
+        self.assertEqual(links, ["https://example.com", "https://two.example/path"])
 
     def test_send_message_uses_send_endpoint(self) -> None:
         client = StubClient()
@@ -661,6 +692,42 @@ class GmailHelpersTest(unittest.TestCase):
         self.assertEqual(client.calls[0][1], ("users", "messages", "modify"))
         self.assertFalse(record.raw["unread"])
         self.assertEqual(record.raw["label_ids"], ["INBOX"])
+
+    def test_fetch_detail_content_marks_html_messages(self) -> None:
+        client = StubClient()
+        module = GmailModule()
+        client.add(
+            ("gmail", "users", "messages", "get", "[('format', 'full'), ('id', 'msg-1'), ('userId', 'me')]"),
+            {
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Hello"},
+                        {"name": "From", "value": "Alice <alice@example.com>"},
+                        {"name": "To", "value": "me@example.com"},
+                        {"name": "Date", "value": "Fri, 06 Mar 2026 10:00:00 +0000"},
+                    ],
+                    "mimeType": "text/html",
+                    "body": {
+                        "data": "PHA+VmlzaXQgPGEgaHJlZj0iaHR0cHM6Ly9leGFtcGxlLmNvbSI+ZXhhbXBsZTwvYT48L3A+"
+                    },
+                },
+                "snippet": "Visit example",
+                "labelIds": ["INBOX"],
+            },
+        )
+        record = Record(
+            key="msg-1",
+            columns=("Hello", "Alice <alice@example.com>", "Mar 06 10:00 AM"),
+            title="Hello",
+            subtitle="Alice <alice@example.com>",
+            raw={},
+        )
+
+        detail = module.fetch_detail_content(client, record)
+
+        self.assertIn("Content-Type: HTML", detail.text)
+        self.assertIn("Visit example (https://example.com)", detail.text)
+        self.assertEqual(detail.links, ["https://example.com"])
 
 
 class DocsModuleTest(unittest.TestCase):
