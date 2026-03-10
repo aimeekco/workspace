@@ -9,6 +9,7 @@ from typing import Any
 from gws_tui.client import GwsClient
 from gws_tui.models import Record
 from gws_tui.modules.base import WorkspaceModule
+from gws_tui.profiles import GwsProfile
 
 
 def parse_task_timestamp(value: str) -> str:
@@ -46,6 +47,9 @@ class TasksModule(WorkspaceModule):
         self.selected_tasklist_id = ""
         self.selected_tasklist_name = "All Tasks"
         self.tasklists: list[dict[str, str]] = []
+        self.active_profile_name = "default"
+        self.available_profiles: list[GwsProfile] = []
+        self.synced_profile_names: tuple[str, ...] = ()
 
     def badge(self) -> str:
         return "Tasks"
@@ -56,6 +60,16 @@ class TasksModule(WorkspaceModule):
     def empty_hint(self) -> str:
         return "Add tasks in Google Tasks, then refresh to sync them here."
 
+    def configure_profiles(
+        self,
+        active_profile_name: str | None,
+        available_profiles: list[GwsProfile],
+        synced_profile_names: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        self.active_profile_name = (active_profile_name or "default").strip() or "default"
+        self.available_profiles = list(available_profiles)
+        self.synced_profile_names = tuple(synced_profile_names or ())
+
     def list_label(self) -> str:
         return self.selected_tasklist_name
 
@@ -63,6 +77,36 @@ class TasksModule(WorkspaceModule):
         return f"Task list: {self.selected_tasklist_name.lower()}"
 
     def tasklist_options(self, client: GwsClient) -> list[dict[str, str]]:
+        target_profiles = self._target_profiles()
+        if len(target_profiles) > 1:
+            options = [{"id": "", "name": "All Tasks"}]
+            for profile in target_profiles:
+                profile_client = self._client_for_profile(client, profile.name)
+                response = profile_client.run(
+                    "tasks",
+                    "tasklists",
+                    "list",
+                    params={"maxResults": 100},
+                    page_all=True,
+                )
+                tasklists = self._collect_items(response, "items")
+                for tasklist in tasklists:
+                    tasklist_id = tasklist.get("id", "")
+                    tasklist_name = tasklist.get("title", "Untitled list")
+                    if not tasklist_id or not tasklist_name:
+                        continue
+                    options.append(
+                        {
+                            "id": self._tasklist_key(profile.name, tasklist_id),
+                            "name": self._display_tasklist_name(tasklist_name, profile.name, True),
+                            "profile_name": profile.name,
+                            "tasklist_id": tasklist_id,
+                            "tasklist_name": tasklist_name,
+                        }
+                    )
+            self.tasklists = options
+            self._sync_selected_tasklist()
+            return self.tasklists
         response = client.run(
             "tasks",
             "tasklists",
@@ -80,12 +124,7 @@ class TasksModule(WorkspaceModule):
                 }
             )
         self.tasklists = [option for option in options if option["name"]]
-        if not any(option["id"] == self.selected_tasklist_id for option in self.tasklists):
-            self.selected_tasklist_id = ""
-            self.selected_tasklist_name = "All Tasks"
-        else:
-            current = next(option for option in self.tasklists if option["id"] == self.selected_tasklist_id)
-            self.selected_tasklist_name = current["name"]
+        self._sync_selected_tasklist()
         return self.tasklists
 
     def set_tasklist(self, tasklist_id: str, tasklist_name: str) -> None:
@@ -95,25 +134,37 @@ class TasksModule(WorkspaceModule):
     def default_create_tasklist_id(self) -> str:
         if self.selected_tasklist_id:
             return self.selected_tasklist_id
-        if len(self.tasklists) > 1:
-            return self.tasklists[1]["id"]
+        default_option = self._default_tasklist_option()
+        if default_option is not None:
+            return default_option["id"]
         return ""
 
     def default_create_tasklist_name(self) -> str:
         if self.selected_tasklist_id:
             return self.selected_tasklist_name
-        if len(self.tasklists) > 1:
-            return self.tasklists[1]["name"]
+        default_option = self._default_tasklist_option()
+        if default_option is not None:
+            return default_option["name"]
         return "No task list"
 
     def fetch_records(self, client: GwsClient) -> list[Record]:
         options = self.tasklist_options(client)
+        target_profiles = self._target_profiles()
+        annotate_profile = len(target_profiles) > 1
         selected_ids = {self.selected_tasklist_id} if self.selected_tasklist_id else None
-        tasklists = [
-            {"id": option["id"], "title": option["name"]}
-            for option in options
-            if option["id"] and (selected_ids is None or option["id"] in selected_ids)
-        ]
+        tasklists = []
+        for option in options:
+            if not option["id"] or (selected_ids is not None and option["id"] not in selected_ids):
+                continue
+            tasklists.append(
+                {
+                    "key": option["id"],
+                    "id": option.get("tasklist_id", option["id"]),
+                    "title": option.get("tasklist_name", option["name"]),
+                    "display_title": option["name"],
+                    "profile_name": option.get("profile_name", ""),
+                }
+            )
         if not tasklists:
             return []
 
@@ -126,6 +177,8 @@ class TasksModule(WorkspaceModule):
         for tasklist, tasks in zip(tasklists, task_pages, strict=False):
             list_id = tasklist.get("id", "")
             list_title = tasklist.get("title", "Untitled list")
+            display_title = tasklist.get("display_title", list_title)
+            profile_name = tasklist.get("profile_name", "")
             for task in sorted(tasks, key=task_sort_key):
                 if task.get("deleted") or task.get("hidden"):
                     continue
@@ -136,7 +189,7 @@ class TasksModule(WorkspaceModule):
                 notes = (task.get("notes") or "").strip()
                 preview_lines = [
                     f"Task: {title}",
-                    f"List: {list_title}",
+                    f"List: {display_title if annotate_profile else list_title}",
                     f"Status: {'Completed' if status == 'completed' else 'Open'}",
                     f"Due: {due}",
                     f"Updated: {updated}",
@@ -145,16 +198,17 @@ class TasksModule(WorkspaceModule):
                     preview_lines.extend(["", notes])
                 records.append(
                     Record(
-                        key=f"{list_id}:{task.get('id', '')}",
-                        columns=(title, list_title, due),
+                        key=self._record_key(profile_name, list_id, str(task.get("id", "")), annotate_profile),
+                        columns=(title, display_title if annotate_profile else list_title, due),
                         title=title,
-                        subtitle=list_title,
+                        subtitle=display_title if annotate_profile else list_title,
                         preview="\n".join(preview_lines).strip(),
                         raw={
                             "task": task,
                             "task_id": task.get("id", ""),
                             "tasklist_id": list_id,
                             "tasklist_title": list_title,
+                            "profile_name": profile_name,
                             "completed": status == "completed",
                         },
                     )
@@ -163,7 +217,8 @@ class TasksModule(WorkspaceModule):
         return records
 
     def fetch_detail(self, client: GwsClient, record: Record) -> str:
-        task = client.run(
+        detail_client = self._client_for_profile(client, record.raw.get("profile_name"))
+        task = detail_client.run(
             "tasks",
             "tasks",
             "get",
@@ -197,17 +252,27 @@ class TasksModule(WorkspaceModule):
         record.raw["completed"] = task.get("status") == "completed"
         return "\n".join(lines)
 
-    def create_task(self, client: GwsClient, tasklist_id: str, title: str, notes: str = "", due_text: str = "") -> dict:
+    def create_task(
+        self,
+        client: GwsClient,
+        tasklist_id: str,
+        title: str,
+        notes: str = "",
+        due_text: str = "",
+        profile_name: str | None = None,
+    ) -> dict:
         body: dict[str, Any] = {"title": title}
         if notes.strip():
             body["notes"] = notes.strip()
         if due_text.strip():
             body["due"] = parse_due_date(due_text)
-        return client.run(
+        target_profile_name, resolved_tasklist_id = self._resolve_task_target(tasklist_id, profile_name)
+        target_client = self._client_for_profile(client, target_profile_name)
+        return target_client.run(
             "tasks",
             "tasks",
             "insert",
-            params={"tasklist": tasklist_id},
+            params={"tasklist": resolved_tasklist_id},
             body=body,
         )
 
@@ -217,7 +282,8 @@ class TasksModule(WorkspaceModule):
         }
         if completed:
             body["completed"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        response = client.run(
+        target_client = self._client_for_profile(client, record.raw.get("profile_name"))
+        response = target_client.run(
             "tasks",
             "tasks",
             "patch",
@@ -243,7 +309,9 @@ class TasksModule(WorkspaceModule):
         self.tasklists = []
 
     def _fetch_tasklist_tasks(self, client: GwsClient, tasklist: dict[str, Any]) -> list[dict[str, Any]]:
-        response = client.run(
+        profile_name = str(tasklist.get("profile_name", "") or "")
+        target_client = self._client_for_profile(client, profile_name)
+        response = target_client.run(
             "tasks",
             "tasks",
             "list",
@@ -266,3 +334,72 @@ class TasksModule(WorkspaceModule):
                 items.extend(page.get(key, []))
             return items
         return response.get(key, [])
+
+    def _target_profiles(self) -> list[GwsProfile]:
+        if not self.available_profiles:
+            return []
+        ordered: list[GwsProfile] = []
+        seen_names: set[str] = set()
+        if self.synced_profile_names:
+            for name in self.synced_profile_names:
+                profile = next((item for item in self.available_profiles if item.name == name), None)
+                if profile is None or profile.name in seen_names:
+                    continue
+                seen_names.add(profile.name)
+                ordered.append(profile)
+            if ordered:
+                return ordered
+        active = next((item for item in self.available_profiles if item.name == self.active_profile_name), None)
+        return [active] if active is not None else []
+
+    def _client_for_profile(self, client: GwsClient, profile_name: str | None) -> GwsClient:
+        if not profile_name:
+            return client
+        if hasattr(client, "with_config_dir"):
+            profile = next((item for item in self.available_profiles if item.name == profile_name), None)
+            if profile is not None:
+                return client.with_config_dir(profile.config_dir)
+        return client
+
+    def _sync_selected_tasklist(self) -> None:
+        if not any(option["id"] == self.selected_tasklist_id for option in self.tasklists):
+            self.selected_tasklist_id = ""
+            self.selected_tasklist_name = "All Tasks"
+            return
+        current = next(option for option in self.tasklists if option["id"] == self.selected_tasklist_id)
+        self.selected_tasklist_name = current["name"]
+
+    def _tasklist_key(self, profile_name: str, tasklist_id: str) -> str:
+        return f"{profile_name}::{tasklist_id}"
+
+    def _split_tasklist_key(self, value: str) -> tuple[str, str]:
+        profile_name, separator, tasklist_id = value.partition("::")
+        if not separator:
+            return "", value
+        return profile_name, tasklist_id
+
+    def _resolve_task_target(self, tasklist_id: str, profile_name: str | None) -> tuple[str, str]:
+        keyed_profile_name, actual_tasklist_id = self._split_tasklist_key(tasklist_id)
+        if keyed_profile_name:
+            return keyed_profile_name, actual_tasklist_id
+        return (profile_name or self.active_profile_name or "").strip(), tasklist_id
+
+    def _display_tasklist_name(self, tasklist_name: str, profile_name: str, annotate_profile: bool) -> str:
+        if not annotate_profile or not profile_name:
+            return tasklist_name
+        return f"{tasklist_name} ({profile_name})"
+
+    def _record_key(self, profile_name: str, tasklist_id: str, task_id: str, annotate_profile: bool) -> str:
+        if not annotate_profile or not profile_name:
+            return f"{tasklist_id}:{task_id}"
+        return f"{profile_name}::{tasklist_id}:{task_id}"
+
+    def _default_tasklist_option(self) -> dict[str, str] | None:
+        candidates = [option for option in self.tasklists if option["id"]]
+        if not candidates:
+            return None
+        current_profile_option = next(
+            (option for option in candidates if option.get("profile_name", "") == self.active_profile_name),
+            None,
+        )
+        return current_profile_option or candidates[0]

@@ -33,6 +33,9 @@ class GwsClient:
     observer: Callable[[GwsCommandEvent], None] | None = None
     config_dir: str | None = None
 
+    def with_config_dir(self, config_dir: str | None) -> "GwsClient":
+        return GwsClient(binary=self.binary, observer=self.observer, config_dir=config_dir)
+
     def run(
         self,
         service: str,

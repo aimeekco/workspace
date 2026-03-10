@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from gws_tui.client import GwsClient
 from gws_tui.models import Record
 from gws_tui.modules.base import WorkspaceModule
+from gws_tui.profiles import GwsProfile
 from gws_tui.planner import (
     BriefRecordRef,
     ContextRecord,
@@ -73,6 +74,15 @@ class TodayModule(WorkspaceModule):
 
     def set_profile_name(self, profile_name: str | None) -> None:
         self.profile_name = (profile_name or "default").strip() or "default"
+
+    def configure_profiles(
+        self,
+        active_profile_name: str | None,
+        available_profiles: list[GwsProfile],
+        synced_profile_names: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        self.set_profile_name(active_profile_name)
+        self.aggregator.configure_profiles(active_profile_name, available_profiles, synced_profile_names)
 
     def fetch_dashboard(self, client: GwsClient, force_refresh: bool = False) -> TodayDashboard:
         context = self.aggregator.collect(client, self.profile_name)

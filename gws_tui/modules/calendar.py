@@ -10,6 +10,7 @@ from typing import Any
 from gws_tui.client import GwsClient
 from gws_tui.models import Record
 from gws_tui.modules.base import WorkspaceModule
+from gws_tui.profiles import GwsProfile
 
 
 def strip_html(value: str) -> str:
@@ -125,6 +126,11 @@ class CalendarModule(WorkspaceModule):
     columns = ("Start", "Calendar", "Title", "Location")
     empty_message = "No upcoming events found."
 
+    def __init__(self) -> None:
+        self.active_profile_name = "default"
+        self.available_profiles: list[GwsProfile] = []
+        self.synced_profile_names: tuple[str, ...] = ()
+
     def badge(self) -> str:
         return "Agenda"
 
@@ -133,6 +139,16 @@ class CalendarModule(WorkspaceModule):
 
     def empty_hint(self) -> str:
         return "Move with the arrow keys, use [ and ] to change month, or press a to create an event."
+
+    def configure_profiles(
+        self,
+        active_profile_name: str | None,
+        available_profiles: list[GwsProfile],
+        synced_profile_names: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        self.active_profile_name = (active_profile_name or "default").strip() or "default"
+        self.available_profiles = list(available_profiles)
+        self.synced_profile_names = tuple(synced_profile_names or ())
 
     def build_event_body(
         self,
@@ -172,8 +188,10 @@ class CalendarModule(WorkspaceModule):
         duration_text: str = "",
         location: str = "",
         description: str = "",
+        profile_name: str | None = None,
     ) -> dict:
-        return client.run(
+        target_client = self._client_for_profile(client, profile_name)
+        return target_client.run(
             "calendar",
             "events",
             "insert",
@@ -188,8 +206,9 @@ class CalendarModule(WorkspaceModule):
             ),
         )
 
-    def delete_event(self, client: GwsClient, calendar_id: str, event_id: str) -> dict:
-        return client.run(
+    def delete_event(self, client: GwsClient, calendar_id: str, event_id: str, profile_name: str | None = None) -> dict:
+        target_client = self._client_for_profile(client, profile_name)
+        return target_client.run(
             "calendar",
             "events",
             "delete",
@@ -205,6 +224,37 @@ class CalendarModule(WorkspaceModule):
         return self.fetch_month_records(client, today.year, today.month)
 
     def fetch_month_records(self, client: GwsClient, year: int, month: int) -> list[Record]:
+        target_profiles = self._target_profiles()
+        if len(target_profiles) > 1:
+            calendar_records: list[Record] = []
+            with ThreadPoolExecutor(max_workers=min(4, len(target_profiles))) as executor:
+                batches = list(
+                    executor.map(
+                        lambda profile: self._fetch_month_records_for_client(
+                            self._client_for_profile(client, profile.name),
+                            year,
+                            month,
+                            profile.name,
+                            True,
+                        ),
+                        target_profiles,
+                    )
+                )
+            for batch in batches:
+                calendar_records.extend(batch)
+            calendar_records.sort(key=lambda record: event_sort_key(record.raw["event"]))
+            return calendar_records
+        profile_name = target_profiles[0].name if len(target_profiles) == 1 else ""
+        return self._fetch_month_records_for_client(client, year, month, profile_name, False)
+
+    def _fetch_month_records_for_client(
+        self,
+        client: GwsClient,
+        year: int,
+        month: int,
+        profile_name: str,
+        annotate_profile: bool,
+    ) -> list[Record]:
         calendars_response = client.run(
             "calendar",
             "calendarList",
@@ -228,7 +278,14 @@ class CalendarModule(WorkspaceModule):
         with ThreadPoolExecutor(max_workers=4) as executor:
             batches = list(
                 executor.map(
-                    lambda calendar: self._fetch_calendar_records(client, calendar, window_start, window_end),
+                    lambda calendar: self._fetch_calendar_records(
+                        client,
+                        calendar,
+                        window_start,
+                        window_end,
+                        profile_name,
+                        annotate_profile,
+                    ),
                     ordered_calendars[:6],
                 )
             )
@@ -248,9 +305,12 @@ class CalendarModule(WorkspaceModule):
         calendar: dict,
         window_start: datetime,
         window_end: datetime,
+        profile_name: str = "",
+        annotate_profile: bool = False,
     ) -> list[Record]:
         calendar_id = calendar["id"]
         calendar_name = calendar.get("summaryOverride") or calendar.get("summary") or calendar_id
+        display_calendar_name = self._calendar_label(calendar_name, profile_name, annotate_profile)
         calendar_writable = calendar_is_writable(calendar)
         events_response = client.run(
             "calendar",
@@ -274,7 +334,7 @@ class CalendarModule(WorkspaceModule):
             location = event.get("location") or ""
             preview = "\n".join(
                 [
-                    f"Calendar: {calendar_name}",
+                    f"Calendar: {display_calendar_name}",
                     f"When: {format_event_time(event)}",
                     f"Where: {location or 'n/a'}",
                     "",
@@ -283,21 +343,22 @@ class CalendarModule(WorkspaceModule):
             )
             records.append(
                 Record(
-                    key=f"{calendar_id}::{event['id']}",
+                    key=self._record_key(profile_name, calendar_id, event["id"], annotate_profile),
                     columns=(
                         format_event_time(event),
-                        calendar_name,
+                        display_calendar_name,
                         summary,
                         location,
                     ),
                     title=summary,
-                    subtitle=calendar_name,
+                    subtitle=display_calendar_name,
                     preview=preview,
                     raw={
                         "day_key": event_day_key(event),
                         "day_keys": event_day_keys(event),
                         "calendar_id": calendar_id,
                         "calendar_name": calendar_name,
+                        "profile_name": profile_name,
                         "calendar_writable": calendar_writable,
                         "event": event,
                     },
@@ -314,7 +375,8 @@ class CalendarModule(WorkspaceModule):
         return response.get(key, [])
 
     def fetch_detail(self, client: GwsClient, record: Record) -> str:
-        event = client.run(
+        detail_client = self._client_for_profile(client, record.raw.get("profile_name"))
+        event = detail_client.run(
             "calendar",
             "events",
             "get",
@@ -344,3 +406,39 @@ class CalendarModule(WorkspaceModule):
         if attendee_lines:
             parts.extend(["", "Attendees:", *attendee_lines])
         return "\n".join(parts)
+
+    def _target_profiles(self) -> list[GwsProfile]:
+        if not self.available_profiles:
+            return []
+        ordered: list[GwsProfile] = []
+        seen_names: set[str] = set()
+        if self.synced_profile_names:
+            for name in self.synced_profile_names:
+                profile = next((item for item in self.available_profiles if item.name == name), None)
+                if profile is None or profile.name in seen_names:
+                    continue
+                seen_names.add(profile.name)
+                ordered.append(profile)
+            if ordered:
+                return ordered
+        active = next((item for item in self.available_profiles if item.name == self.active_profile_name), None)
+        return [active] if active is not None else []
+
+    def _client_for_profile(self, client: GwsClient, profile_name: str | None) -> GwsClient:
+        if not profile_name:
+            return client
+        if hasattr(client, "with_config_dir"):
+            profile = next((item for item in self.available_profiles if item.name == profile_name), None)
+            if profile is not None:
+                return client.with_config_dir(profile.config_dir)
+        return client
+
+    def _calendar_label(self, calendar_name: str, profile_name: str, annotate_profile: bool) -> str:
+        if not annotate_profile or not profile_name:
+            return calendar_name
+        return f"{calendar_name} ({profile_name})"
+
+    def _record_key(self, profile_name: str, calendar_id: str, event_id: str, annotate_profile: bool) -> str:
+        if not annotate_profile or not profile_name:
+            return f"{calendar_id}::{event_id}"
+        return f"{profile_name}::{calendar_id}::{event_id}"

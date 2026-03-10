@@ -14,18 +14,31 @@ from gws_tui.modules.docs import DocsModule, document_body_end_index, extract_do
 from gws_tui.modules.gmail import GmailModule, extract_body, extract_links, format_message_date, html_to_rich_text, normalize_forward_subject, normalize_reply_subject
 from gws_tui.modules.sheets import SheetsModule
 from gws_tui.modules.tasks import TasksModule
+from gws_tui.profiles import GwsProfile
 
 
 class StubClient:
-    def __init__(self) -> None:
-        self.responses: dict[tuple[str, ...], object] = {}
-        self.calls: list[tuple[str, tuple[str, ...], dict | None, dict | None]] = []
+    def __init__(
+        self,
+        config_dir: str = "",
+        responses: dict[tuple[str, ...], object] | None = None,
+        calls: list[tuple[str, str, tuple[str, ...], dict | None, dict | None]] | None = None,
+    ) -> None:
+        self.config_dir = config_dir
+        self.responses = responses if responses is not None else {}
+        self.calls = calls if calls is not None else []
 
     def add(self, key: tuple[str, ...], response: object) -> None:
         self.responses[key] = response
 
+    def add_for_config(self, config_dir: str, key: tuple[str, ...], response: object) -> None:
+        self.responses[(config_dir, *key)] = response
+
+    def with_config_dir(self, config_dir: str | None):  # noqa: ANN001
+        return StubClient(config_dir=config_dir or "", responses=self.responses, calls=self.calls)
+
     def run(self, service: str, *segments: str, params=None, body=None, page_all=False, page_limit=5):  # noqa: ANN001
-        self.calls.append((service, segments, params, body))
+        self.calls.append((self.config_dir, service, segments, params, body))
         normalized = dict(params or {})
         if service == "calendar" and segments == ("events", "list"):
             if "timeMin" in normalized:
@@ -33,6 +46,10 @@ class StubClient:
             if "timeMax" in normalized:
                 normalized["timeMax"] = "<dynamic>"
         lookup = (service, *segments, repr(sorted(normalized.items())))
+        if self.config_dir:
+            config_lookup = (self.config_dir, *lookup)
+            if config_lookup in self.responses:
+                return self.responses[config_lookup]
         return self.responses[lookup]
 
 
@@ -173,9 +190,9 @@ class CalendarModuleTest(unittest.TestCase):
         )
 
         self.assertEqual(response["id"], "evt-1")
-        self.assertEqual(client.calls[-1][1], ("events", "insert"))
-        self.assertEqual(client.calls[-1][2], {"calendarId": "primary", "sendUpdates": "none"})
-        self.assertEqual(client.calls[-1][3]["summary"], "Planning")
+        self.assertEqual(client.calls[-1][2], ("events", "insert"))
+        self.assertEqual(client.calls[-1][3], {"calendarId": "primary", "sendUpdates": "none"})
+        self.assertEqual(client.calls[-1][4]["summary"], "Planning")
 
     def test_delete_event_uses_delete_endpoint(self) -> None:
         client = StubClient()
@@ -187,8 +204,59 @@ class CalendarModuleTest(unittest.TestCase):
 
         module.delete_event(client, "primary", "evt-1")  # type: ignore[arg-type]
 
-        self.assertEqual(client.calls[-1][1], ("events", "delete"))
-        self.assertEqual(client.calls[-1][2], {"calendarId": "primary", "eventId": "evt-1", "sendUpdates": "none"})
+        self.assertEqual(client.calls[-1][2], ("events", "delete"))
+        self.assertEqual(client.calls[-1][3], {"calendarId": "primary", "eventId": "evt-1", "sendUpdates": "none"})
+
+    def test_fetch_records_merges_synced_profiles(self) -> None:
+        client = StubClient(config_dir="/profiles/personal")
+        module = CalendarModule()
+        module.configure_profiles(
+            "personal",
+            [
+                GwsProfile(name="personal", config_dir="/profiles/personal"),
+                GwsProfile(name="school", config_dir="/profiles/school"),
+            ],
+            ["personal", "school"],
+        )
+
+        client.add_for_config(
+            "/profiles/personal",
+            ("calendar", "calendarList", "list", "[('maxResults', 250), ('showHidden', False)]"),
+            [{"items": [{"id": "primary", "summary": "Primary", "primary": True}]}],
+        )
+        client.add_for_config(
+            "/profiles/personal",
+            (
+                "calendar",
+                "events",
+                "list",
+                "[('calendarId', 'primary'), ('maxResults', 250), ('orderBy', 'startTime'), ('singleEvents', True), ('timeMax', '<dynamic>'), ('timeMin', '<dynamic>')]",
+            ),
+            [{"items": [{"id": "evt-1", "summary": "Standup", "start": {"dateTime": "2026-03-07T10:00:00Z"}}]}],
+        )
+        client.add_for_config(
+            "/profiles/school",
+            ("calendar", "calendarList", "list", "[('maxResults', 250), ('showHidden', False)]"),
+            [{"items": [{"id": "classes", "summary": "Classes"}]}],
+        )
+        client.add_for_config(
+            "/profiles/school",
+            (
+                "calendar",
+                "events",
+                "list",
+                "[('calendarId', 'classes'), ('maxResults', 250), ('orderBy', 'startTime'), ('singleEvents', True), ('timeMax', '<dynamic>'), ('timeMin', '<dynamic>')]",
+            ),
+            [{"items": [{"id": "evt-2", "summary": "Lecture", "start": {"dateTime": "2026-03-08T09:00:00Z"}}]}],
+        )
+
+        records = module.fetch_records(client)  # type: ignore[arg-type]
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0].subtitle, "Primary (personal)")
+        self.assertEqual(records[1].subtitle, "Classes (school)")
+        self.assertEqual(records[1].raw["profile_name"], "school")
+        self.assertTrue(any(call[0] == "/profiles/school" for call in client.calls))
 
     def test_event_day_keys_spans_multi_day_all_day_event(self) -> None:
         keys = event_day_keys(
@@ -316,9 +384,9 @@ class GmailHelpersTest(unittest.TestCase):
         response = module.send_message(client, "to@example.com", "Hello", "Body text")  # type: ignore[arg-type]
 
         self.assertEqual(response["id"], "sent-1")
-        self.assertEqual(client.calls[-1][0], "gmail")
-        self.assertEqual(client.calls[-1][1], ("users", "messages", "send"))
-        self.assertIn("raw", client.calls[-1][3])
+        self.assertEqual(client.calls[-1][1], "gmail")
+        self.assertEqual(client.calls[-1][2], ("users", "messages", "send"))
+        self.assertIn("raw", client.calls[-1][4])
 
     def test_reply_to_message_uses_send_endpoint_with_thread_id(self) -> None:
         client = StubClient()
@@ -337,9 +405,9 @@ class GmailHelpersTest(unittest.TestCase):
         )
 
         self.assertEqual(response["id"], "reply-1")
-        self.assertEqual(client.calls[-1][1], ("users", "messages", "send"))
-        self.assertEqual(client.calls[-1][3]["threadId"], "thread-1")
-        self.assertIn("raw", client.calls[-1][3])
+        self.assertEqual(client.calls[-1][2], ("users", "messages", "send"))
+        self.assertEqual(client.calls[-1][4]["threadId"], "thread-1")
+        self.assertIn("raw", client.calls[-1][4])
 
     def test_create_draft_uses_drafts_endpoint(self) -> None:
         client = StubClient()
@@ -355,9 +423,9 @@ class GmailHelpersTest(unittest.TestCase):
         )
 
         self.assertEqual(response["id"], "draft-1")
-        self.assertEqual(client.calls[-1][1], ("users", "drafts", "create"))
-        self.assertIn("message", client.calls[-1][3])
-        self.assertIn("raw", client.calls[-1][3]["message"])
+        self.assertEqual(client.calls[-1][2], ("users", "drafts", "create"))
+        self.assertIn("message", client.calls[-1][4])
+        self.assertIn("raw", client.calls[-1][4]["message"])
 
     def test_create_draft_sets_thread_id_for_reply_drafts(self) -> None:
         client = StubClient()
@@ -374,7 +442,7 @@ class GmailHelpersTest(unittest.TestCase):
             references="<message-id@example.com>",
         )
 
-        self.assertEqual(client.calls[-1][3]["message"]["threadId"], "thread-1")
+        self.assertEqual(client.calls[-1][4]["message"]["threadId"], "thread-1")
 
     def test_mailbox_options_include_system_and_custom_labels(self) -> None:
         client = StubClient()
@@ -427,9 +495,9 @@ class GmailHelpersTest(unittest.TestCase):
         records = module.fetch_records(client)  # type: ignore[arg-type]
 
         self.assertEqual(records, [])
-        self.assertEqual(client.calls[-1][1], ("users", "messages", "list"))
-        self.assertEqual(client.calls[-1][2]["q"], "from:boss@example.com is:unread")
-        self.assertEqual(client.calls[-1][2]["labelIds"], "INBOX")
+        self.assertEqual(client.calls[-1][2], ("users", "messages", "list"))
+        self.assertEqual(client.calls[-1][3]["q"], "from:boss@example.com is:unread")
+        self.assertEqual(client.calls[-1][3]["labelIds"], "INBOX")
         self.assertEqual(module.subtitle(), 'Mailbox: inbox, query="from:boss@example.com", unread only')
 
     def test_fetch_records_uses_selected_mailbox_label(self) -> None:
@@ -453,7 +521,7 @@ class GmailHelpersTest(unittest.TestCase):
         records = module.fetch_records(client)  # type: ignore[arg-type]
 
         self.assertEqual(records, [])
-        self.assertEqual(client.calls[-1][2]["labelIds"], "SENT")
+        self.assertEqual(client.calls[-1][3]["labelIds"], "SENT")
         self.assertEqual(module.list_label(), "Sent")
 
     def test_fetch_records_prefixes_unread_subjects(self) -> None:
@@ -544,7 +612,7 @@ class GmailHelpersTest(unittest.TestCase):
 
         detail = module.fetch_detail(client, record)
 
-        self.assertEqual(client.calls[-1][1], ("users", "threads", "get"))
+        self.assertEqual(client.calls[-1][2], ("users", "threads", "get"))
         self.assertIn("Thread: Project update", detail)
         self.assertIn("Messages: 2", detail)
         self.assertIn("--- Message 2 [selected] ---", detail)
@@ -619,7 +687,7 @@ class GmailHelpersTest(unittest.TestCase):
 
         module.trash_message(client, "msg-1")  # type: ignore[arg-type]
 
-        self.assertEqual(client.calls[-1][1], ("users", "messages", "trash"))
+        self.assertEqual(client.calls[-1][2], ("users", "messages", "trash"))
 
     def test_list_user_labels_filters_to_custom_labels(self) -> None:
         client = StubClient()
@@ -652,8 +720,8 @@ class GmailHelpersTest(unittest.TestCase):
         )
 
         self.assertEqual(response["id"], "msg-1")
-        self.assertEqual(client.calls[-1][1], ("users", "messages", "modify"))
-        self.assertEqual(client.calls[-1][3], {"addLabelIds": ["Label_2"], "removeLabelIds": ["Label_1"]})
+        self.assertEqual(client.calls[-1][2], ("users", "messages", "modify"))
+        self.assertEqual(client.calls[-1][4], {"addLabelIds": ["Label_2"], "removeLabelIds": ["Label_1"]})
 
     def test_fetch_detail_marks_unread_message_read(self) -> None:
         client = StubClient()
@@ -689,7 +757,7 @@ class GmailHelpersTest(unittest.TestCase):
         detail = module.fetch_detail(client, record)
 
         self.assertIn("Subject: Hello", detail)
-        self.assertEqual(client.calls[0][1], ("users", "messages", "modify"))
+        self.assertEqual(client.calls[0][2], ("users", "messages", "modify"))
         self.assertFalse(record.raw["unread"])
         self.assertEqual(record.raw["label_ids"], ["INBOX"])
 
@@ -846,9 +914,9 @@ class DocsModuleTest(unittest.TestCase):
         response = module.create_document(client, title="Spec", body="Hello docs")  # type: ignore[arg-type]
 
         self.assertEqual(response["documentId"], "doc-1")
-        self.assertEqual(client.calls[0][1], ("documents", "create"))
-        self.assertEqual(client.calls[1][1], ("documents", "batchUpdate"))
-        self.assertEqual(client.calls[1][3]["requests"][0]["insertText"]["text"], "Hello docs")
+        self.assertEqual(client.calls[0][2], ("documents", "create"))
+        self.assertEqual(client.calls[1][2], ("documents", "batchUpdate"))
+        self.assertEqual(client.calls[1][4]["requests"][0]["insertText"]["text"], "Hello docs")
 
     def test_update_document_text_replaces_existing_content(self) -> None:
         client = StubClient()
@@ -862,7 +930,7 @@ class DocsModuleTest(unittest.TestCase):
         response = module.update_document_text(client, "doc-1", "Updated text")  # type: ignore[arg-type]
 
         self.assertEqual(response["documentId"], "doc-1")
-        requests = client.calls[-1][3]["requests"]
+        requests = client.calls[-1][4]["requests"]
         self.assertEqual(requests[0]["deleteContentRange"]["range"], {"startIndex": 1, "endIndex": 14})
         self.assertEqual(requests[1]["insertText"]["text"], "Updated text")
 
@@ -1013,11 +1081,11 @@ class SheetsModuleTest(unittest.TestCase):
             body="Name | Amount\nRent | 1200",
         )
 
-        self.assertEqual(client.calls[0][1], ("spreadsheets", "values", "clear"))
-        self.assertEqual(client.calls[1][1], ("spreadsheets", "values", "update"))
-        self.assertEqual(client.calls[1][2]["range"], "'Summary'!A1:B2")
+        self.assertEqual(client.calls[0][2], ("spreadsheets", "values", "clear"))
+        self.assertEqual(client.calls[1][2], ("spreadsheets", "values", "update"))
+        self.assertEqual(client.calls[1][3]["range"], "'Summary'!A1:B2")
         self.assertEqual(
-            client.calls[1][3]["values"],
+            client.calls[1][4]["values"],
             [["Name", "Amount"], ["Rent", "1200"]],
         )
 
@@ -1277,10 +1345,10 @@ class TasksModuleTest(unittest.TestCase):
         response = module.create_task(client, tasklist_id="list-1", title="Buy milk", notes="2% only", due_text="2026-03-09")  # type: ignore[arg-type]
 
         self.assertEqual(response["id"], "task-1")
-        self.assertEqual(client.calls[-1][1], ("tasks", "insert"))
-        self.assertEqual(client.calls[-1][3]["title"], "Buy milk")
-        self.assertEqual(client.calls[-1][3]["notes"], "2% only")
-        self.assertEqual(client.calls[-1][3]["due"], "2026-03-09T00:00:00Z")
+        self.assertEqual(client.calls[-1][2], ("tasks", "insert"))
+        self.assertEqual(client.calls[-1][4]["title"], "Buy milk")
+        self.assertEqual(client.calls[-1][4]["notes"], "2% only")
+        self.assertEqual(client.calls[-1][4]["due"], "2026-03-09T00:00:00Z")
 
     def test_update_task_status_uses_patch_endpoint(self) -> None:
         client = StubClient()
@@ -1297,10 +1365,83 @@ class TasksModuleTest(unittest.TestCase):
         response = module.update_task_status(client, record, completed=True)  # type: ignore[arg-type]
 
         self.assertEqual(response["id"], "task-1")
-        self.assertEqual(client.calls[-1][1], ("tasks", "patch"))
-        self.assertEqual(client.calls[-1][3]["status"], "completed")
-        self.assertIn("completed", client.calls[-1][3])
+        self.assertEqual(client.calls[-1][2], ("tasks", "patch"))
+        self.assertEqual(client.calls[-1][4]["status"], "completed")
+        self.assertIn("completed", client.calls[-1][4])
         self.assertTrue(record.raw["completed"])
+
+    def test_fetch_records_merges_synced_profiles(self) -> None:
+        client = StubClient(config_dir="/profiles/personal")
+        module = TasksModule()
+        module.configure_profiles(
+            "school",
+            [
+                GwsProfile(name="personal", config_dir="/profiles/personal"),
+                GwsProfile(name="school", config_dir="/profiles/school"),
+            ],
+            ["personal", "school"],
+        )
+        client.add_for_config(
+            "/profiles/personal",
+            ("tasks", "tasklists", "list", "[('maxResults', 100)]"),
+            [{"items": [{"id": "list-1", "title": "Personal"}]}],
+        )
+        client.add_for_config(
+            "/profiles/personal",
+            (
+                "tasks",
+                "tasks",
+                "list",
+                "[('maxResults', 100), ('showAssigned', True), ('showCompleted', True), ('showDeleted', False), ('showHidden', False), ('tasklist', 'list-1')]",
+            ),
+            [{"items": [{"id": "task-1", "title": "Buy milk", "status": "needsAction"}]}],
+        )
+        client.add_for_config(
+            "/profiles/school",
+            ("tasks", "tasklists", "list", "[('maxResults', 100)]"),
+            [{"items": [{"id": "list-2", "title": "School"}]}],
+        )
+        client.add_for_config(
+            "/profiles/school",
+            (
+                "tasks",
+                "tasks",
+                "list",
+                "[('maxResults', 100), ('showAssigned', True), ('showCompleted', True), ('showDeleted', False), ('showHidden', False), ('tasklist', 'list-2')]",
+            ),
+            [{"items": [{"id": "task-2", "title": "Study", "status": "needsAction"}]}],
+        )
+
+        records = module.fetch_records(client)  # type: ignore[arg-type]
+
+        self.assertEqual(module.default_create_tasklist_id(), "school::list-2")
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0].subtitle, "Personal (personal)")
+        self.assertEqual(records[1].subtitle, "School (school)")
+        self.assertEqual(records[1].raw["profile_name"], "school")
+
+    def test_create_task_uses_target_profile_from_synced_tasklist(self) -> None:
+        client = StubClient(config_dir="/profiles/personal")
+        module = TasksModule()
+        module.configure_profiles(
+            "personal",
+            [
+                GwsProfile(name="personal", config_dir="/profiles/personal"),
+                GwsProfile(name="school", config_dir="/profiles/school"),
+            ],
+            ["personal", "school"],
+        )
+        client.add_for_config(
+            "/profiles/school",
+            ("tasks", "tasks", "insert", "[('tasklist', 'list-2')]"),
+            {"id": "task-2"},
+        )
+
+        response = module.create_task(client, tasklist_id="school::list-2", title="Study")  # type: ignore[arg-type]
+
+        self.assertEqual(response["id"], "task-2")
+        self.assertEqual(client.calls[-1][0], "/profiles/school")
+        self.assertEqual(client.calls[-1][2], ("tasks", "insert"))
 
 
 if __name__ == "__main__":

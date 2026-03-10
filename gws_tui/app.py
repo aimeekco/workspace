@@ -14,7 +14,7 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, ScrollableContainer
+from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
 from textual.coordinate import Coordinate
 from textual.events import Key
 from textual.screen import ModalScreen
@@ -27,10 +27,17 @@ from gws_tui.modules.calendar import CalendarModule
 from gws_tui.modules.drive import DriveModule
 from gws_tui.modules.docs import DocsModule
 from gws_tui.modules.gmail import GmailDetail, GmailModule
-from gws_tui.modules.sheets import SheetsModule
+from gws_tui.modules.sheets import SheetsModule, column_label, grid_text_to_values, values_to_grid_text
 from gws_tui.modules.tasks import TasksModule
 from gws_tui.modules.today import SECTION_LABELS, SECTION_ORDER, TodayDashboard, TodayModule
-from gws_tui.profiles import GwsProfile, GwsProfileDiagnostic, discover_profiles, inspect_profile, inspect_profile_local
+from gws_tui.profiles import (
+    GwsProfile,
+    GwsProfileDiagnostic,
+    discover_profiles,
+    inspect_profile,
+    inspect_profile_local,
+    load_workspace_settings,
+)
 from gws_tui.planner import task_create_defaults
 
 MODULE_ACCENTS = {
@@ -359,12 +366,14 @@ class CreateEventScreen(ModalScreen[dict[str, str] | None]):
     def __init__(
         self,
         calendar_id: str,
+        profile_name: str = "",
         initial_start: str = "",
         initial_end: str = "",
         initial_duration: str = "60",
     ) -> None:
         super().__init__()
         self.calendar_id = calendar_id
+        self.profile_name = profile_name
         self.initial_start = initial_start
         self.initial_end = initial_end
         self.initial_duration = initial_duration
@@ -372,7 +381,10 @@ class CreateEventScreen(ModalScreen[dict[str, str] | None]):
     def compose(self) -> ComposeResult:
         with Container(id="event-modal", classes="modal-window"):
             yield Static("Create Calendar Event", classes="modal-title")
-            yield Static("Use local 24-hour time: YYYY-MM-DD HH:MM. End is optional if duration is set.", classes="modal-subtitle")
+            subtitle = "Use local 24-hour time: YYYY-MM-DD HH:MM. End is optional if duration is set."
+            if self.profile_name:
+                subtitle = f"Profile: {self.profile_name}. {subtitle}"
+            yield Static(subtitle, classes="modal-subtitle")
             yield Input(value=self.calendar_id, placeholder="primary", id="event-calendar")
             yield Input(placeholder="Title", id="event-summary")
             with Horizontal(classes="modal-row"):
@@ -398,6 +410,7 @@ class CreateEventScreen(ModalScreen[dict[str, str] | None]):
         if event.button.id != "event-create":
             return
         values = {
+            "profile_name": self.profile_name,
             "calendar_id": self.query_one("#event-calendar", Input).value.strip() or "primary",
             "summary": self.query_one("#event-summary", Input).value.strip(),
             "start": self.query_one("#event-start", Input).value.strip(),
@@ -775,11 +788,12 @@ class EditDocumentScreen(ModalScreen[dict[str, str] | None]):
 
 
 class EditSheetScreen(ModalScreen[dict[str, str] | None]):
-    """Edit Google Sheets cell data as aligned columns."""
+    """Edit Google Sheets cell data with a live grid preview."""
 
     BINDINGS = [
         ("escape", "cancel", "Cancel"),
         ("ctrl+s", "save", "Save"),
+        ("ctrl+l", "align_columns", "Align"),
         ("ctrl+o", "insert_row_below", "Row Below"),
         ("ctrl+shift+o", "insert_row_above", "Row Above"),
         ("ctrl+d", "delete_row", "Delete Row"),
@@ -797,16 +811,27 @@ class EditSheetScreen(ModalScreen[dict[str, str] | None]):
             yield Static("Edit Google Sheet", classes="modal-title")
             yield Static(f"{self.title} · {self.sheet_title}", classes="modal-subtitle")
             yield Static(
-                "Ctrl+S save, Ctrl+O below, Ctrl+Shift+O above, Ctrl+D delete row, Ctrl+G bottom.",
+                "Ctrl+S save, Ctrl+L align, Ctrl+O below, Ctrl+Shift+O above, Ctrl+D delete row, Ctrl+G bottom.",
                 classes="modal-subtitle",
             )
-            yield Static("Keep `|` between cells; long rows scroll horizontally.", classes="modal-subtitle")
-            yield TextArea(self.body, id="sheet-edit-body", soft_wrap=False)
+            yield Static("Edit the pipe-delimited text below; the preview updates like a sheet grid.", classes="modal-subtitle")
+            yield Static("", id="sheet-edit-context", classes="modal-subtitle")
+            with Horizontal(id="sheet-edit-layout"):
+                with Vertical(id="sheet-preview-pane"):
+                    yield Static("Preview", id="sheet-preview-title", classes="pane-title")
+                    yield DataTable(id="sheet-preview-grid")
+                with Vertical(id="sheet-editor-pane"):
+                    yield Static("Source", id="sheet-source-title", classes="pane-title")
+                    yield TextArea(self.body, id="sheet-edit-body", soft_wrap=False)
             with Horizontal(classes="modal-actions"):
                 yield Button("Cancel", id="sheet-edit-cancel")
                 yield Button("Save", variant="primary", id="sheet-edit-submit")
 
     def on_mount(self) -> None:
+        preview = self.query_one("#sheet-preview-grid", DataTable)
+        preview.cursor_type = "cell"
+        preview.fixed_columns = 1
+        self._refresh_sheet_preview()
         self.query_one("#sheet-edit-body", TextArea).focus()
 
     def action_cancel(self) -> None:
@@ -815,6 +840,21 @@ class EditSheetScreen(ModalScreen[dict[str, str] | None]):
     def action_save(self) -> None:
         body = self.query_one("#sheet-edit-body", TextArea).text
         self.dismiss({"body": body})
+
+    def action_align_columns(self) -> None:
+        area = self.query_one("#sheet-edit-body", TextArea)
+        lines = self._editor_lines(area)
+        row, column = area.cursor_location
+        current_row = max(0, min(row, len(lines) - 1))
+        current_cell = self._cell_index_for_cursor(lines[current_row] if lines else "", column)
+        aligned = values_to_grid_text(grid_text_to_values(area.text))
+        area.load_text(aligned)
+        aligned_lines = self._editor_lines(area)
+        target_row = max(0, min(current_row, len(aligned_lines) - 1))
+        target_column = self._cursor_column_for_cell(aligned_lines[target_row] if aligned_lines else "", current_cell)
+        area.move_cursor((target_row, target_column))
+        area.focus()
+        self._refresh_sheet_preview()
 
     def action_insert_row_below(self) -> None:
         self._insert_row(offset=1)
@@ -874,6 +914,76 @@ class EditSheetScreen(ModalScreen[dict[str, str] | None]):
         target_column = min(column, len(lines[target_row]))
         area.move_cursor((target_row, target_column))
         area.focus()
+        self._refresh_sheet_preview()
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if event.text_area.id != "sheet-edit-body":
+            return
+        self._refresh_sheet_preview()
+
+    def on_text_area_selection_changed(self, event: TextArea.SelectionChanged) -> None:
+        if event.text_area.id != "sheet-edit-body":
+            return
+        self._refresh_sheet_context()
+
+    def _refresh_sheet_preview(self) -> None:
+        area = self.query_one("#sheet-edit-body", TextArea)
+        values = grid_text_to_values(area.text)
+        row_count = max(1, len(values))
+        column_count = max((len(row) for row in values), default=1)
+        table = self.query_one("#sheet-preview-grid", DataTable)
+        table.clear(columns=True)
+        table.add_column("#", width=4)
+        for column_index in range(column_count):
+            table.add_column(column_label(column_index + 1), width=max(8, len(column_label(column_index + 1)) + 2))
+        padded_values = values or [[]]
+        for row_index, row in enumerate(padded_values, start=1):
+            cells = [row[cell_index] if cell_index < len(row) else "" for cell_index in range(column_count)]
+            table.add_row(str(row_index), *cells, key=f"row-{row_index}")
+        self._refresh_sheet_context(row_count=row_count, column_count=column_count)
+
+    def _refresh_sheet_context(self, row_count: int | None = None, column_count: int | None = None) -> None:
+        area = self.query_one("#sheet-edit-body", TextArea)
+        lines = self._editor_lines(area)
+        row_index, cursor_column = area.cursor_location
+        row_index = max(0, min(row_index, len(lines) - 1))
+        if row_count is None:
+            row_count = max(1, len(grid_text_to_values(area.text)))
+        if column_count is None:
+            column_count = max((len(row) for row in grid_text_to_values(area.text)), default=1)
+        cell_index = self._cell_index_for_cursor(lines[row_index] if lines else "", cursor_column)
+        display_row = row_index + 1
+        display_col = cell_index + 1
+        cell_label = f"{column_label(display_col)}{display_row}"
+        values = grid_text_to_values(area.text)
+        current_value = ""
+        if row_index < len(values) and cell_index < len(values[row_index]):
+            current_value = values[row_index][cell_index]
+        preview = self.query_one("#sheet-preview-grid", DataTable)
+        if row_index < max(1, row_count) and cell_index < max(1, column_count):
+            preview.move_cursor(row=row_index, column=cell_index + 1)
+        summary = f"{cell_label} · {row_count} rows x {column_count} cols"
+        if current_value:
+            summary = f'{summary} · "{current_value[:40]}"'
+        self.query_one("#sheet-edit-context", Static).update(summary)
+
+    def _cell_index_for_cursor(self, line: str, cursor_column: int) -> int:
+        effective_column = max(0, min(cursor_column, len(line)))
+        return line[:effective_column].count("|")
+
+    def _cursor_column_for_cell(self, line: str, cell_index: int) -> int:
+        if cell_index <= 0:
+            return 0
+        separator_count = 0
+        for index, char in enumerate(line):
+            if char == "|":
+                separator_count += 1
+                if separator_count == cell_index:
+                    target = index + 1
+                    while target < len(line) and line[target] == " ":
+                        target += 1
+                    return target
+        return len(line)
 
 
 class CalendarGridView(PassiveScrollableContainer):
@@ -2270,6 +2380,10 @@ class Workspace(App):
         max-width: 96%;
     }
 
+    #sheet-edit-modal {
+        width: 148;
+    }
+
     .modal-title {
         text-style: bold;
         margin-bottom: 1;
@@ -2303,6 +2417,26 @@ class Workspace(App):
 
     #doc-edit-body, #sheet-edit-body {
         height: 1fr;
+    }
+
+    #sheet-edit-layout {
+        height: 1fr;
+        margin-bottom: 1;
+    }
+
+    #sheet-preview-pane {
+        width: 46;
+        margin-right: 1;
+    }
+
+    #sheet-editor-pane {
+        width: 1fr;
+    }
+
+    #sheet-preview-grid {
+        height: 1fr;
+        border: tall #343434;
+        background: #181818;
     }
 
     #confirm-message {
@@ -2402,6 +2536,7 @@ class Workspace(App):
         super().__init__()
         self.activity_lines: deque[Text] = deque(maxlen=60)
         self.profiles, default_profile_name = discover_profiles()
+        self.workspace_settings = load_workspace_settings()
         self.current_profile_name = default_profile_name
         self.profile_diagnostics_cache: dict[str, GwsProfileDiagnostic] = {}
         self.profile_diagnostics_loaded_at = 0.0
@@ -2413,7 +2548,7 @@ class Workspace(App):
         self.modules = built_in_modules()
         self.module_views: dict[str, object] = {}
         self.current_module_id = self.modules[0].id
-        self._sync_today_profile_name()
+        self._sync_module_profiles()
         self.prompt_for_profile_on_mount = (
             len(self.profiles) > 1
             and not os.environ.get("GWS_TUI_PROFILE", "").strip()
@@ -2610,12 +2745,14 @@ class Workspace(App):
             self.update_status("Add is only available in Calendar and Tasks")
             return
         default_calendar_id = "primary"
+        default_profile_name = self.current_profile_name or ""
         initial_start = ""
         initial_end = ""
         initial_duration = "60"
         record = self.module_views[self.current_module_id].current_record()
         if record is not None and record.raw.get("calendar_writable") and "calendar_id" in record.raw:
             default_calendar_id = record.raw["calendar_id"]
+            default_profile_name = str(record.raw.get("profile_name", default_profile_name) or default_profile_name)
         calendar_view = self.module_views.get("calendar")
         if isinstance(calendar_view, CalendarGridView):
             selected_day = calendar_view.selected_day()
@@ -2623,7 +2760,7 @@ class Workspace(App):
                 day_text = selected_day.isoformat()
                 initial_start = f"{day_text} 09:00"
         self.push_screen(
-            CreateEventScreen(default_calendar_id, initial_start, initial_end, initial_duration),
+            CreateEventScreen(default_calendar_id, default_profile_name, initial_start, initial_end, initial_duration),
             self._handle_event_result,
         )
 
@@ -2892,8 +3029,10 @@ class Workspace(App):
     def _open_profile_picker(self, title: str = "Switch Workspace Profile") -> None:
         profiles, default_profile_name = discover_profiles()
         self.profiles = profiles
+        self.workspace_settings = load_workspace_settings()
         if self.current_profile_name is None or not any(profile.name == self.current_profile_name for profile in profiles):
             self.current_profile_name = default_profile_name
+        self._sync_module_profiles()
         diagnostics = self._profile_diagnostics_snapshot()
         screen = ProfilePickerScreen(self.profiles, diagnostics, self.current_profile_name, title=title)
         self.push_screen(
@@ -2922,7 +3061,7 @@ class Workspace(App):
         self.current_profile_name = profile.name
         if isinstance(self.client, GwsClient):
             self.client.config_dir = profile.config_dir
-        self._sync_today_profile_name()
+        self._sync_module_profiles()
         self.activity_lines.clear()
         self.query_one("#activity-log", Static).update("")
         self._refresh_profile_label()
@@ -2939,10 +3078,26 @@ class Workspace(App):
             label = f"gws activity · {self.current_profile_name}"
         self.query_one("#activity-label", Static).update(label)
 
-    def _sync_today_profile_name(self) -> None:
+    def _sync_module_profiles(self) -> None:
         for module in self.modules:
             if isinstance(module, TodayModule):
-                module.set_profile_name(self.current_profile_name)
+                module.configure_profiles(
+                    self.current_profile_name,
+                    self.profiles,
+                    list(self.workspace_settings.module_sync.get("today", ())),
+                )
+            elif isinstance(module, CalendarModule):
+                module.configure_profiles(
+                    self.current_profile_name,
+                    self.profiles,
+                    list(self.workspace_settings.module_sync.get("calendar", ())),
+                )
+            elif isinstance(module, TasksModule):
+                module.configure_profiles(
+                    self.current_profile_name,
+                    self.profiles,
+                    list(self.workspace_settings.module_sync.get("tasks", ())),
+                )
 
     def _profile_diagnostics_snapshot(self) -> dict[str, GwsProfileDiagnostic]:
         diagnostics: dict[str, GwsProfileDiagnostic] = {}
@@ -2997,6 +3152,7 @@ class Workspace(App):
             result["duration"],
             result["location"],
             result["description"],
+            result.get("profile_name", ""),
         )
 
     def _present_email_links(self, detail: GmailDetail) -> None:
@@ -3103,7 +3259,14 @@ class Workspace(App):
             self.update_status("Create task is only available in Tasks")
             return
         self.update_status("Creating task...")
-        self._create_task(tasks_module, result["tasklist_id"], result["title"], result["notes"], result["due"])
+        self._create_task(
+            tasks_module,
+            result["tasklist_id"],
+            result["title"],
+            result["notes"],
+            result["due"],
+            result.get("profile_name", ""),
+        )
 
     def _handle_edit_doc_result(self, result: dict[str, str] | None, record: Record) -> None:
         if result is None:
@@ -3221,6 +3384,7 @@ class Workspace(App):
         duration_text: str,
         location: str,
         description: str,
+        profile_name: str = "",
     ) -> None:
         try:
             calendar_module.add_event(
@@ -3232,6 +3396,7 @@ class Workspace(App):
                 duration_text=duration_text,
                 location=location,
                 description=description,
+                profile_name=profile_name,
             )
         except ValueError as exc:
             self.call_from_thread(self.update_status, f"Event failed: {exc}")
@@ -3269,6 +3434,7 @@ class Workspace(App):
                 self.client,
                 calendar_id=record.raw["calendar_id"],
                 event_id=record.raw["event"]["id"],
+                profile_name=str(record.raw.get("profile_name", "") or ""),
             )
         except GwsError as exc:
             self.call_from_thread(self.update_status, f"Delete event failed: {exc.message}")
@@ -3349,9 +3515,17 @@ class Workspace(App):
         title: str,
         notes: str,
         due_text: str,
+        profile_name: str = "",
     ) -> None:
         try:
-            tasks_module.create_task(self.client, tasklist_id=tasklist_id, title=title, notes=notes, due_text=due_text)
+            tasks_module.create_task(
+                self.client,
+                tasklist_id=tasklist_id,
+                title=title,
+                notes=notes,
+                due_text=due_text,
+                profile_name=profile_name,
+            )
         except ValueError as exc:
             self.call_from_thread(self.update_status, f"Task create failed: {exc}")
             return
@@ -3428,6 +3602,7 @@ class Workspace(App):
                     title=title,
                     notes=notes,
                     due_text=due_text,
+                    profile_name=str(draft.payload.get("profile_name", "") or self.current_profile_name or ""),
                 )
                 target_module_id = "tasks"
                 success_message = "Draft applied: task created"
@@ -3450,6 +3625,7 @@ class Workspace(App):
                     duration_text=duration_text,
                     location=str(draft.payload.get("location", "")).strip(),
                     description=str(draft.payload.get("description", "") or draft.detail).strip(),
+                    profile_name=str(draft.payload.get("profile_name", "") or self.current_profile_name or ""),
                 )
                 target_module_id = "calendar"
                 success_message = "Draft applied: calendar event created"

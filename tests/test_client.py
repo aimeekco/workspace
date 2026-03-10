@@ -77,6 +77,16 @@ class GwsClientTest(unittest.TestCase):
 
         self.assertEqual(run_mock.call_args.kwargs["env"]["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"], "/tmp/gws-work")
 
+    def test_with_config_dir_clones_client_configuration(self) -> None:
+        events: list[GwsCommandEvent] = []
+        client = GwsClient(binary="custom-gws", observer=events.append, config_dir="/tmp/gws-personal")
+
+        clone = client.with_config_dir("/tmp/gws-school")
+
+        self.assertEqual(clone.binary, "custom-gws")
+        self.assertIs(clone.observer, client.observer)
+        self.assertEqual(clone.config_dir, "/tmp/gws-school")
+
 
 if __name__ == "__main__":
     unittest.main()

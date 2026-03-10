@@ -28,6 +28,11 @@ class GwsProfileDiagnostic:
     probe_message: str = ""
 
 
+@dataclass(slots=True)
+class WorkspaceSettings:
+    module_sync: dict[str, tuple[str, ...]]
+
+
 def discover_profiles(cwd: Path | None = None) -> tuple[list[GwsProfile], str | None]:
     cwd = cwd or Path.cwd()
     explicit_profile = os.environ.get("GWS_TUI_PROFILE", "").strip() or None
@@ -112,6 +117,36 @@ def load_profiles_file(path: Path) -> tuple[list[GwsProfile], str | None]:
                 continue
             profiles.append(GwsProfile(name=name.strip(), config_dir=config_dir.strip()))
     return profiles, default_name.strip() if isinstance(default_name, str) and default_name.strip() else None
+
+
+def load_workspace_settings(cwd: Path | None = None) -> WorkspaceSettings:
+    cwd = cwd or Path.cwd()
+    profiles_file = resolve_profiles_file(cwd)
+    if profiles_file is None:
+        return WorkspaceSettings(module_sync={})
+    try:
+        payload = json.loads(profiles_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return WorkspaceSettings(module_sync={})
+    module_sync: dict[str, tuple[str, ...]] = {}
+    raw_module_sync = payload.get("module_sync", {})
+    if isinstance(raw_module_sync, dict):
+        for module_id, profile_names in raw_module_sync.items():
+            if not isinstance(module_id, str) or not isinstance(profile_names, list):
+                continue
+            ordered_names: list[str] = []
+            seen_names: set[str] = set()
+            for profile_name in profile_names:
+                if not isinstance(profile_name, str):
+                    continue
+                normalized = profile_name.strip()
+                if not normalized or normalized in seen_names:
+                    continue
+                seen_names.add(normalized)
+                ordered_names.append(normalized)
+            if ordered_names:
+                module_sync[module_id.strip()] = tuple(ordered_names)
+    return WorkspaceSettings(module_sync=module_sync)
 
 
 def _derive_profile_name(config_dir: str, by_name: dict[str, GwsProfile]) -> str:

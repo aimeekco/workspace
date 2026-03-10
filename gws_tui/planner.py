@@ -17,6 +17,7 @@ from gws_tui.modules.drive import DriveModule
 from gws_tui.modules.gmail import GmailModule
 from gws_tui.modules.sheets import SheetsModule
 from gws_tui.modules.tasks import TasksModule
+from gws_tui.profiles import GwsProfile
 
 
 CACHE_SCHEMA_VERSION = 1
@@ -252,6 +253,21 @@ def task_create_defaults(draft: DraftAction, context: WorkspaceContext | None) -
 class WorkspaceContextAggregator:
     """Collect a compact cross-module context for the Today view."""
 
+    def __init__(self) -> None:
+        self.active_profile_name = "default"
+        self.available_profiles: list[GwsProfile] = []
+        self.synced_profile_names: tuple[str, ...] = ()
+
+    def configure_profiles(
+        self,
+        active_profile_name: str | None,
+        available_profiles: list[GwsProfile],
+        synced_profile_names: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        self.active_profile_name = (active_profile_name or "default").strip() or "default"
+        self.available_profiles = list(available_profiles)
+        self.synced_profile_names = tuple(synced_profile_names or ())
+
     def collect(self, client: GwsClient, profile_name: str) -> WorkspaceContext:
         context = WorkspaceContext(profile_name=profile_name or "default", day_iso=date.today().isoformat())
 
@@ -296,6 +312,7 @@ class WorkspaceContextAggregator:
 
     def _collect_calendar(self, client: GwsClient) -> tuple[list[ContextRecord], dict[str, str]]:
         module = CalendarModule()
+        module.configure_profiles(self.active_profile_name, self.available_profiles, self.synced_profile_names)
         today_key = date.today().isoformat()
         records = [record for record in module.fetch_records(client) if today_key in (record.raw.get("day_keys") or [])]
         items = [
@@ -314,6 +331,7 @@ class WorkspaceContextAggregator:
 
     def _collect_tasks(self, client: GwsClient) -> tuple[list[ContextRecord], dict[str, str]]:
         module = TasksModule()
+        module.configure_profiles(self.active_profile_name, self.available_profiles, self.synced_profile_names)
         records = [record for record in module.fetch_records(client) if not bool(record.raw.get("completed"))]
         items = [
             ContextRecord(

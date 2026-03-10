@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from gws_tui.profiles import GwsProfile, discover_profiles, inspect_profile, inspect_profile_local
+from gws_tui.profiles import GwsProfile, discover_profiles, inspect_profile, inspect_profile_local, load_workspace_settings
 
 
 class ProfilesTest(unittest.TestCase):
@@ -174,6 +174,32 @@ class ProfilesTest(unittest.TestCase):
         self.assertEqual(profiles_by_name["default"], str(default_dir))
         self.assertEqual(profiles_by_name["school"], str(school_dir))
         self.assertEqual(default_name, "school")
+
+    def test_load_workspace_settings_reads_module_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            profiles_file = root / ".gws_tui_profiles.json"
+            profiles_file.write_text(
+                json.dumps(
+                    {
+                        "profiles": {
+                            "personal": "~/.config/gws",
+                            "school": "~/.config/gws-school",
+                        },
+                        "module_sync": {
+                            "today": ["personal", "school", "school"],
+                            "calendar": ["school"],
+                            "tasks": ["personal"],
+                        },
+                    }
+                )
+            )
+
+            settings = load_workspace_settings(root)
+
+        self.assertEqual(settings.module_sync["today"], ("personal", "school"))
+        self.assertEqual(settings.module_sync["calendar"], ("school",))
+        self.assertEqual(settings.module_sync["tasks"], ("personal",))
 
 
 if __name__ == "__main__":
