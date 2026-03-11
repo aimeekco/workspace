@@ -2,19 +2,32 @@ from __future__ import annotations
 
 import calendar as calendar_lib
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from html import unescape
 import re
 from typing import Any
+
+from rich.console import Group
+from rich.text import Text
 
 from gws_tui.client import GwsClient
 from gws_tui.models import Record
 from gws_tui.modules.base import WorkspaceModule
 from gws_tui.profiles import GwsProfile
+from gws_tui.rich_text import extract_links, html_to_rich_text, html_to_text, linkify_text
+
+HIDDEN_PROFILE_NAMES = {"school"}
+
+
+@dataclass(slots=True)
+class CalendarDetail:
+    text: str
+    renderable: Group | Text
+    links: list[str]
 
 
 def strip_html(value: str) -> str:
-    return re.sub(r"<[^>]+>", "", unescape(value or "")).strip()
+    return html_to_text(value or "").strip()
 
 
 def parse_rfc3339(value: str | None) -> datetime | None:
@@ -224,7 +237,7 @@ class CalendarModule(WorkspaceModule):
         return self.fetch_month_records(client, today.year, today.month)
 
     def fetch_month_records(self, client: GwsClient, year: int, month: int) -> list[Record]:
-        target_profiles = self._target_profiles()
+        target_profiles = [profile for profile in self._target_profiles() if not self._profile_hidden(profile.name)]
         if len(target_profiles) > 1:
             calendar_records: list[Record] = []
             with ThreadPoolExecutor(max_workers=min(4, len(target_profiles))) as executor:
@@ -245,6 +258,8 @@ class CalendarModule(WorkspaceModule):
             calendar_records.sort(key=lambda record: event_sort_key(record.raw["event"]))
             return calendar_records
         profile_name = target_profiles[0].name if len(target_profiles) == 1 else ""
+        if not profile_name and self._profile_hidden(self.active_profile_name):
+            return []
         return self._fetch_month_records_for_client(client, year, month, profile_name, False)
 
     def _fetch_month_records_for_client(
@@ -375,6 +390,9 @@ class CalendarModule(WorkspaceModule):
         return response.get(key, [])
 
     def fetch_detail(self, client: GwsClient, record: Record) -> str:
+        return self.fetch_detail_content(client, record).text
+
+    def fetch_detail_content(self, client: GwsClient, record: Record) -> CalendarDetail:
         detail_client = self._client_for_profile(client, record.raw.get("profile_name"))
         event = detail_client.run(
             "calendar",
@@ -391,6 +409,8 @@ class CalendarModule(WorkspaceModule):
         attendee_lines = [attendee.get("email", "unknown attendee") for attendee in attendees[:10]]
         if len(attendees) > 10:
             attendee_lines.append(f"+{len(attendees) - 10} more")
+        description = str(event.get("description") or "").strip()
+        description_text = strip_html(description or "n/a")
 
         parts = [
             f"Title: {event.get('summary') or '(No title)'}",
@@ -401,11 +421,47 @@ class CalendarModule(WorkspaceModule):
             f"Meet: {(event.get('hangoutLink') or 'n/a')}",
             "",
             "Description:",
-            strip_html(event.get("description") or "n/a"),
+            description_text,
         ]
         if attendee_lines:
             parts.extend(["", "Attendees:", *attendee_lines])
-        return "\n".join(parts)
+        detail_text = "\n".join(parts)
+
+        header = Text()
+        header.append("Title: ", style="bold #d8dee9")
+        header.append(f"{event.get('summary') or '(No title)'}")
+        header.append("\n")
+        header.append("Calendar: ", style="bold #d8dee9")
+        header.append(f"{record.raw['calendar_name']}")
+        header.append("\n")
+        header.append("When: ", style="bold #d8dee9")
+        header.append(f"{start} -> {end}")
+        header.append("\n")
+        header.append("Where: ", style="bold #d8dee9")
+        header.append_text(linkify_text(event.get("location") or "n/a"))
+        header.append("\n")
+        header.append("Status: ", style="bold #d8dee9")
+        header.append(f"{event.get('status') or 'confirmed'}")
+        header.append("\n")
+        header.append("Meet: ", style="bold #d8dee9")
+        header.append_text(linkify_text(event.get("hangoutLink") or "n/a"))
+
+        renderables: list[Text] = [header, Text(""), Text("Description:", style="bold #d8dee9")]
+        if description:
+            renderables.append(html_to_rich_text(description))
+        else:
+            renderables.append(Text("n/a"))
+        if attendee_lines:
+            attendees_text = Text()
+            attendees_text.append("Attendees:\n", style="bold #d8dee9")
+            attendees_text.append("\n".join(attendee_lines))
+            renderables.extend([Text(""), attendees_text])
+
+        return CalendarDetail(
+            text=detail_text,
+            renderable=Group(*renderables),
+            links=extract_links(detail_text),
+        )
 
     def _target_profiles(self) -> list[GwsProfile]:
         if not self.available_profiles:
@@ -442,3 +498,6 @@ class CalendarModule(WorkspaceModule):
         if not annotate_profile or not profile_name:
             return f"{calendar_id}::{event_id}"
         return f"{profile_name}::{calendar_id}::{event_id}"
+
+    def _profile_hidden(self, profile_name: str | None) -> bool:
+        return (profile_name or "").strip().lower() in HIDDEN_PROFILE_NAMES

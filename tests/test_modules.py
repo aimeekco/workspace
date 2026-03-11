@@ -207,7 +207,70 @@ class CalendarModuleTest(unittest.TestCase):
         self.assertEqual(client.calls[-1][2], ("events", "delete"))
         self.assertEqual(client.calls[-1][3], {"calendarId": "primary", "eventId": "evt-1", "sendUpdates": "none"})
 
-    def test_fetch_records_merges_synced_profiles(self) -> None:
+    def test_fetch_detail_keeps_html_links_in_description_text(self) -> None:
+        client = StubClient()
+        module = CalendarModule()
+        client.add(
+            ("calendar", "events", "get", "[('calendarId', 'primary'), ('eventId', 'evt-1')]"),
+            {
+                "id": "evt-1",
+                "summary": "Planning",
+                "start": {"dateTime": "2026-03-09T17:00:00Z"},
+                "end": {"dateTime": "2026-03-09T18:00:00Z"},
+                "description": '<p>Agenda on <a href="https://example.com/doc">the doc</a></p>',
+            },
+        )
+        record = Record(
+            key="primary::evt-1",
+            columns=("Mar 09 09:00 AM", "Primary", "Planning", ""),
+            title="Planning",
+            subtitle="Primary",
+            raw={
+                "calendar_id": "primary",
+                "calendar_name": "Primary",
+                "event": {"id": "evt-1"},
+            },
+        )
+
+        detail = module.fetch_detail(client, record)  # type: ignore[arg-type]
+
+        self.assertIn("Description:", detail)
+        self.assertIn("Agenda on the doc (https://example.com/doc)", detail)
+
+    def test_fetch_detail_content_extracts_calendar_links(self) -> None:
+        client = StubClient()
+        module = CalendarModule()
+        client.add(
+            ("calendar", "events", "get", "[('calendarId', 'primary'), ('eventId', 'evt-2')]"),
+            {
+                "id": "evt-2",
+                "summary": "Planning",
+                "start": {"dateTime": "2026-03-09T17:00:00Z"},
+                "end": {"dateTime": "2026-03-09T18:00:00Z"},
+                "description": '<p>Agenda on <a href="https://example.com/doc">the doc</a></p>',
+                "hangoutLink": "https://meet.google.com/abc-defg-hij",
+                "location": "https://maps.example.com/room-1",
+            },
+        )
+        record = Record(
+            key="primary::evt-2",
+            columns=("Mar 09 09:00 AM", "Primary", "Planning", "https://maps.example.com/room-1"),
+            title="Planning",
+            subtitle="Primary",
+            raw={
+                "calendar_id": "primary",
+                "calendar_name": "Primary",
+                "event": {"id": "evt-2"},
+            },
+        )
+
+        detail = module.fetch_detail_content(client, record)  # type: ignore[arg-type]
+
+        self.assertIn("https://example.com/doc", detail.links)
+        self.assertIn("https://meet.google.com/abc-defg-hij", detail.links)
+        self.assertIn("https://maps.example.com/room-1", detail.links)
+
+    def test_fetch_records_skips_hidden_school_profile(self) -> None:
         client = StubClient(config_dir="/profiles/personal")
         module = CalendarModule()
         module.configure_profiles(
@@ -252,11 +315,10 @@ class CalendarModuleTest(unittest.TestCase):
 
         records = module.fetch_records(client)  # type: ignore[arg-type]
 
-        self.assertEqual(len(records), 2)
-        self.assertEqual(records[0].subtitle, "Primary (personal)")
-        self.assertEqual(records[1].subtitle, "Classes (school)")
-        self.assertEqual(records[1].raw["profile_name"], "school")
-        self.assertTrue(any(call[0] == "/profiles/school" for call in client.calls))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].subtitle, "Primary")
+        self.assertEqual(records[0].raw["profile_name"], "personal")
+        self.assertFalse(any(call[0] == "/profiles/school" for call in client.calls))
 
     def test_event_day_keys_spans_multi_day_all_day_event(self) -> None:
         keys = event_day_keys(

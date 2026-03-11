@@ -23,7 +23,7 @@ from textual.widgets import Button, Checkbox, ContentSwitcher, DataTable, Footer
 from gws_tui.client import GwsClient, GwsCommandEvent, GwsError
 from gws_tui.models import Record
 from gws_tui.modules import WorkspaceModule, built_in_modules
-from gws_tui.modules.calendar import CalendarModule
+from gws_tui.modules.calendar import CalendarDetail, CalendarModule
 from gws_tui.modules.drive import DriveModule
 from gws_tui.modules.docs import DocsModule
 from gws_tui.modules.gmail import GmailDetail, GmailModule
@@ -654,7 +654,7 @@ class GmailSearchScreen(ModalScreen[str | None]):
 
 
 class LinkPickerScreen(ModalScreen[dict[str, str] | None]):
-    """Choose a link from the selected Gmail message."""
+    """Choose a link from the selected record."""
 
     BINDINGS = [("escape", "cancel", "Cancel"), ("enter", "open_selected", "Open")]
 
@@ -664,7 +664,7 @@ class LinkPickerScreen(ModalScreen[dict[str, str] | None]):
 
     def compose(self) -> ComposeResult:
         with Container(id="links-modal", classes="modal-window"):
-            yield Static("Open Gmail Link", classes="modal-title")
+            yield Static("Open Link", classes="modal-title")
             yield Static("Select a link to open or copy.", classes="modal-subtitle")
             yield ListView(
                 *(ListItem(Static(link), name=link) for link in self.links),
@@ -996,6 +996,8 @@ class CalendarGridView(PassiveScrollableContainer):
         self.month_anchor = date.today().replace(day=1)
         self.day_records: dict[str, list[Record]] = {}
         self.coordinate_day: dict[tuple[int, int], date | None] = {}
+        self.current_key: str | None = None
+        self.detail_cache: dict[str, CalendarDetail] = {}
         self.loaded = False
 
     def compose(self) -> ComposeResult:
@@ -1008,8 +1010,10 @@ class CalendarGridView(PassiveScrollableContainer):
                 yield Static("Month", classes="pane-title")
                 yield DataTable(id="calendar-grid")
             with Container(classes="pane pane-detail"):
-                yield Static("Day Agenda", id="detail-label-calendar", classes="pane-title")
-                with FocusableScrollableContainer(classes="detail-container"):
+                yield Static("Events", id="day-events-label-calendar", classes="pane-title")
+                yield DataTable(id="calendar-day-events")
+                yield Static("Event Preview", id="detail-label-calendar", classes="pane-title")
+                with FocusableScrollableContainer(classes="detail-container", id="calendar-detail-container"):
                     yield Static("Select a day to view events.", id="detail-calendar")
 
     def on_mount(self) -> None:
@@ -1017,6 +1021,10 @@ class CalendarGridView(PassiveScrollableContainer):
         table.cursor_type = "cell"
         table.zebra_stripes = False
         table.add_columns("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
+        event_table = self.query_one("#calendar-day-events", DataTable)
+        event_table.cursor_type = "row"
+        event_table.zebra_stripes = True
+        event_table.add_columns("Start", "Event")
 
     def load_if_needed(self) -> None:
         if not self.loaded:
@@ -1024,6 +1032,7 @@ class CalendarGridView(PassiveScrollableContainer):
 
     def action_refresh(self) -> None:
         self.loaded = True
+        self.detail_cache.clear()
         self._set_detail_text(self._state_text("Loading calendar", self.module.loading_message()))
         self.app.update_status("Loading calendar...")
         self._load_month()
@@ -1054,6 +1063,7 @@ class CalendarGridView(PassiveScrollableContainer):
 
     def _render_month(self, records: list[Record]) -> None:
         self.day_records = {}
+        self.current_key = None
         for record in records:
             day_keys = record.raw.get("day_keys") or []
             for day_key in day_keys:
@@ -1118,12 +1128,18 @@ class CalendarGridView(PassiveScrollableContainer):
         return f"{title[:13]}..."
 
     def _show_day_preview(self, selected_day: date | None) -> None:
-        self.query_one("#detail-label-calendar", Static).update("Day Agenda")
+        event_table = self.query_one("#calendar-day-events", DataTable)
+        event_table.clear()
+        self.current_key = None
         if selected_day is None:
+            self.query_one("#day-events-label-calendar", Static).update("Events")
+            self._set_detail_label("Event Preview")
             self._set_detail_text(self._state_text("Out of month", "Move to a date inside the current month to inspect its agenda."))
             return
         records = self.day_records.get(selected_day.isoformat(), [])
+        self.query_one("#day-events-label-calendar", Static).update(selected_day.strftime("%A, %B %d"))
         if not records:
+            self._set_detail_label("Event Preview")
             self._set_detail_text(
                 self._state_text(
                     selected_day.strftime("%A, %B %d"),
@@ -1132,15 +1148,10 @@ class CalendarGridView(PassiveScrollableContainer):
                 )
             )
             return
-        lines = [selected_day.strftime("%A, %B %d"), ""]
         for record in records:
-            event = record.raw["event"]
-            lines.append(f"{record.title}")
-            lines.append(f"{record.subtitle}  {self.module.columns[0]}: {record.columns[0]}")
-            if record.columns[3]:
-                lines.append(f"Location: {record.columns[3]}")
-            lines.append("")
-        self._set_detail_text("\n".join(lines).rstrip())
+            event_table.add_row(record.columns[0], record.title, key=record.key)
+        event_table.move_cursor(row=0, column=0)
+        self.show_preview(records[0].key)
         self.app.update_status("Calendar: day preview ready")
 
     def _handle_error(self, message: str) -> None:
@@ -1149,16 +1160,44 @@ class CalendarGridView(PassiveScrollableContainer):
         self._set_detail_text(self._state_text("Calendar request failed", message))
         self.app.update_status("Calendar: request failed")
 
+    def _set_detail_label(self, value: str) -> None:
+        self.query_one("#detail-label-calendar", Static).update(value)
+
     def _set_detail_text(self, value: str) -> None:
+        self._set_detail_renderable(Text(value))
+
+    def _set_detail_renderable(self, renderable: Group | Text) -> None:
         self.query_one("#detail-calendar", Static).update(
             Panel(
-                Text(value),
+                renderable,
                 title="Calendar",
                 subtitle="Agenda",
                 border_style=MODULE_ACCENTS["calendar"],
                 box=box.ROUNDED,
             )
         )
+
+    def _preview_renderable(self, record: Record) -> Group:
+        event = record.raw["event"]
+        status = str(event.get("status") or "confirmed")
+        renderable = Text()
+        renderable.append(record.title, style="bold #f2f2f2")
+        renderable.append("\n\n")
+        renderable.append("Calendar: ", style="bold #d8dee9")
+        renderable.append(record.subtitle)
+        renderable.append("\n")
+        renderable.append("When: ", style="bold #d8dee9")
+        renderable.append(record.columns[0])
+        if record.columns[3]:
+            renderable.append("\n")
+            renderable.append("Location: ", style="bold #d8dee9")
+            renderable.append(record.columns[3])
+        renderable.append("\n")
+        renderable.append("Status: ", style="bold #d8dee9")
+        renderable.append(status)
+        hint = Text("\n\nPress Enter to open the full event. Press o to open links from the selected event.")
+        hint.stylize("#a7adba")
+        return Group(renderable, hint)
 
     def _state_text(self, heading: str, message: str, hint: str = "") -> str:
         lines = [heading, "", message]
@@ -1176,13 +1215,71 @@ class CalendarGridView(PassiveScrollableContainer):
             return
         self._show_day_preview(self.coordinate_day.get((event.coordinate.row, event.coordinate.column)))
 
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id != "calendar-day-events" or event.row_key is None:
+            return
+        self.show_preview(str(event.row_key.value))
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "calendar-day-events" or event.row_key is None:
+            return
+        self.open_record(str(event.row_key.value))
+
+    def show_preview(self, key: str) -> None:
+        record = next((record for records in self.day_records.values() for record in records if record.key == key), None)
+        if record is None:
+            return
+        self.current_key = key
+        self._set_detail_label("Event Preview")
+        self._set_detail_renderable(self._preview_renderable(record))
+
+    def open_record(self, key: str) -> None:
+        record = next((record for records in self.day_records.values() for record in records if record.key == key), None)
+        if record is None:
+            return
+        self.current_key = key
+        self._set_detail_label("Event Detail")
+        if key in self.detail_cache:
+            self._render_detail(self.detail_cache[key])
+            return
+        self._set_detail_text(self._state_text("Loading event detail", "Fetching the selected calendar event..."))
+        self.app.update_status("Loading calendar detail...")
+        self._load_detail(key)
+
+    @work(thread=True, exclusive=True)
+    def _load_detail(self, key: str) -> None:
+        record = self._record_by_key(key)
+        if record is None:
+            return
+        try:
+            detail = self.module.fetch_detail_content(self.client, record)
+        except GwsError as exc:
+            self.app.call_from_thread(self._set_detail_text, self._state_text("Calendar detail failed", exc.message))
+            self.app.call_from_thread(self.app.update_status, "Calendar detail failed")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.app.call_from_thread(self._set_detail_text, self._state_text("Calendar detail failed", str(exc)))
+            self.app.call_from_thread(self.app.update_status, "Calendar detail failed")
+            return
+        self.detail_cache[key] = detail
+        self.app.call_from_thread(self._render_detail, detail)
+
+    def _render_detail(self, detail: CalendarDetail) -> None:
+        self._set_detail_renderable(detail.renderable)
+        self.app.update_status("Calendar: detail loaded")
+
+    def _record_by_key(self, key: str) -> Record | None:
+        for records in self.day_records.values():
+            for record in records:
+                if record.key == key:
+                    return record
+        return None
+
     def current_record(self) -> Record | None:
-        table = self.query_one("#calendar-grid", DataTable)
-        selected_day = self.coordinate_day.get((table.cursor_coordinate.row, table.cursor_coordinate.column))
-        if selected_day is None:
-            return None
-        records = self.day_records.get(selected_day.isoformat(), [])
-        return records[0] if records else None
+        if self.current_key is None:
+            records = self.selected_day_records()
+            return records[0] if records else None
+        return self._record_by_key(self.current_key)
 
     def selected_day(self) -> date | None:
         table = self.query_one("#calendar-grid", DataTable)
@@ -1198,6 +1295,8 @@ class CalendarGridView(PassiveScrollableContainer):
         self.day_records = {}
         self.coordinate_day = {}
         self.month_anchor = date.today().replace(day=1)
+        self.current_key = None
+        self.detail_cache.clear()
         self.loaded = False
 
 
@@ -2631,8 +2730,10 @@ class Workspace(App):
             return self.current_module_id == "today"
         if action == "add_event":
             return self.current_module_id in {"calendar", "tasks"}
-        if action in {"compose_email", "reply_email", "reply_all_email", "forward_email", "edit_labels", "search_email", "toggle_unread_filter", "open_email_link"}:
+        if action in {"compose_email", "reply_email", "reply_all_email", "forward_email", "edit_labels", "search_email", "toggle_unread_filter"}:
             return self.current_module_id == "gmail"
+        if action == "open_email_link":
+            return self.current_module_id in {"gmail", "calendar"}
         if action == "delete_email":
             return self.current_module_id in {"gmail", "calendar"}
         if action == "create_doc":
@@ -2920,10 +3021,24 @@ class Workspace(App):
         self._load_label_editor(gmail_module, record.key, record.title, current_label_ids)
 
     def action_open_email_link(self) -> None:
+        calendar_module = self._current_calendar_module()
+        calendar_view = self.module_views.get("calendar")
+        if calendar_module is not None and isinstance(calendar_view, CalendarGridView):
+            record = calendar_view.current_record()
+            if record is None:
+                self.update_status("Open link: no calendar event selected")
+                return
+            detail = calendar_view.detail_cache.get(record.key)
+            if detail is not None:
+                self._present_links(detail.links, "Open link: no links found in this event")
+                return
+            self.update_status("Loading calendar links...")
+            self._load_calendar_links(calendar_module, calendar_view, record)
+            return
         gmail_module = self._current_gmail_module()
         gmail_view = self.module_views.get("gmail")
         if gmail_module is None or not isinstance(gmail_view, GmailView):
-            self.update_status("Open link is only available in Gmail")
+            self.update_status("Open link is only available in Gmail and Calendar")
             return
         record = gmail_view.current_record()
         if record is None:
@@ -2931,7 +3046,7 @@ class Workspace(App):
             return
         detail = gmail_view.detail_cache.get(record.key)
         if detail is not None:
-            self._present_email_links(detail)
+            self._present_links(detail.links, "Open link: no links found in this email")
             return
         self.update_status("Loading email links...")
         self._load_email_links(gmail_module, gmail_view, record)
@@ -3155,14 +3270,14 @@ class Workspace(App):
             result.get("profile_name", ""),
         )
 
-    def _present_email_links(self, detail: GmailDetail) -> None:
-        if not detail.links:
-            self.update_status("Open link: no links found in this email")
+    def _present_links(self, links: list[str], empty_message: str) -> None:
+        if not links:
+            self.update_status(empty_message)
             return
-        if len(detail.links) == 1:
-            self._handle_link_result({"action": "open", "url": detail.links[0]})
+        if len(links) == 1:
+            self._handle_link_result({"action": "open", "url": links[0]})
             return
-        self.push_screen(LinkPickerScreen(detail.links), self._handle_link_result)
+        self.push_screen(LinkPickerScreen(links), self._handle_link_result)
 
     def _handle_link_result(self, result: dict[str, str] | None) -> None:
         if result is None:
@@ -3425,7 +3540,23 @@ class Workspace(App):
     def _finish_loading_email_links(self, gmail_view: GmailView, record_key: str, detail: GmailDetail) -> None:
         gmail_view.detail_cache[record_key] = detail
         gmail_view._refresh_row(record_key)
-        self._present_email_links(detail)
+        self._present_links(detail.links, "Open link: no links found in this email")
+
+    @work(thread=True, exclusive=True)
+    def _load_calendar_links(self, calendar_module: CalendarModule, calendar_view: CalendarGridView, record: Record) -> None:
+        try:
+            detail = calendar_module.fetch_detail_content(self.client, record)
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Open link failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Open link failed: {exc}")
+            return
+        self.call_from_thread(self._finish_loading_calendar_links, calendar_view, record.key, detail)
+
+    def _finish_loading_calendar_links(self, calendar_view: CalendarGridView, record_key: str, detail: CalendarDetail) -> None:
+        calendar_view.detail_cache[record_key] = detail
+        self._present_links(detail.links, "Open link: no links found in this event")
 
     @work(thread=True, exclusive=True)
     def _delete_calendar_event(self, calendar_module: CalendarModule, record: Record) -> None:
