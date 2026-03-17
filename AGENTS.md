@@ -89,6 +89,7 @@ Keep this order aligned with:
 ### Drive
 - Defaults to `My Drive`
 - Folder navigation is handled in-module and in the Drive-specific view
+- Opening a file stays in-TUI: Docs/Sheets open internal editors and other files open a read-only viewer
 
 ### Sheets
 - Editing is currently a large text-based aligned grid, not a native cell grid

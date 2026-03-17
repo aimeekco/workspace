@@ -104,7 +104,7 @@ class DriveModule(WorkspaceModule):
             if kind == "Folder":
                 preview_lines.extend(["", "Press Enter to open this folder."])
             else:
-                preview_lines.extend(["", item.get("webViewLink", "")])
+                preview_lines.extend(["", "Press Enter to open this file in the internal viewer."])
             records.append(
                 Record(
                     key=item["id"],

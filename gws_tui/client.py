@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -83,6 +84,45 @@ class GwsClient:
         except json.JSONDecodeError as exc:
             self._emit(command, "error", f"Invalid JSON response: {exc}")
             raise GwsError(command, f"Invalid JSON response: {exc}") from exc
+
+    def run_binary(
+        self,
+        service: str,
+        *segments: str,
+        params: dict[str, Any] | None = None,
+    ) -> bytes:
+        command = [self.binary, service, *segments]
+        if params is not None:
+            command.extend(["--params", json.dumps(params)])
+
+        with tempfile.NamedTemporaryFile(prefix="gws_tui_blob_", suffix=".bin", delete=False) as output_file:
+            output_path = output_file.name
+
+        command.extend(["--output", output_path])
+        self._emit(command, "start")
+
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=self._command_env(),
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.strip() or "gws command failed"
+                self._emit(command, "error", stderr)
+                raise GwsError(command, stderr)
+            with open(output_path, "rb") as handle:
+                payload = handle.read()
+        finally:
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
+
+        self._emit(command, "ok", f"{len(payload)} bytes")
+        return payload
 
     def _emit(self, command: list[str], status: str, detail: str = "") -> None:
         if self.observer is None:

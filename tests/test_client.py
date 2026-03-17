@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -86,6 +87,36 @@ class GwsClientTest(unittest.TestCase):
         self.assertEqual(clone.binary, "custom-gws")
         self.assertIs(clone.observer, client.observer)
         self.assertEqual(clone.config_dir, "/tmp/gws-school")
+
+    def test_run_binary_returns_downloaded_bytes(self) -> None:
+        client = GwsClient()
+
+        def fake_run(command, **kwargs):  # noqa: ANN001
+            output_index = command.index("--output")
+            output_path = command[output_index + 1]
+            Path(output_path).write_bytes(b"hello world")
+            return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", side_effect=fake_run) as run_mock:
+            payload = client.run_binary("drive", "files", "get", params={"fileId": "abc", "alt": "media"})
+
+        self.assertEqual(payload, b"hello world")
+        self.assertIn("--params", run_mock.call_args.args[0])
+        self.assertIn("--output", run_mock.call_args.args[0])
+
+    def test_run_binary_raises_for_cli_error(self) -> None:
+        client = GwsClient()
+        completed = subprocess.CompletedProcess(
+            args=["gws"],
+            returncode=1,
+            stdout="",
+            stderr="download failed",
+        )
+        with patch("subprocess.run", return_value=completed):
+            with self.assertRaises(GwsError) as ctx:
+                client.run_binary("drive", "files", "get", params={"fileId": "abc", "alt": "media"})
+
+        self.assertIn("download failed", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -21,6 +21,15 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, ContentSwitcher, DataTable, Footer, Header, Input, ListItem, ListView, Static, TextArea
 
 from gws_tui.client import GwsClient, GwsCommandEvent, GwsError
+from gws_tui.file_preview import (
+    GOOGLE_DRAWING_MIME,
+    GOOGLE_SLIDE_MIME,
+    is_google_doc_mime,
+    is_google_sheet_mime,
+    is_google_workspace_mime,
+    render_binary_preview,
+    render_unavailable_preview,
+)
 from gws_tui.models import Record
 from gws_tui.modules import WorkspaceModule, built_in_modules
 from gws_tui.modules.calendar import CalendarDetail, CalendarModule
@@ -51,6 +60,7 @@ MODULE_ACCENTS = {
 }
 
 PROFILE_DIAGNOSTICS_TTL_SECONDS = 30.0
+MAX_INLINE_FILE_BYTES = 4 * 1024 * 1024
 
 
 class PassiveScrollableContainer(ScrollableContainer):
@@ -770,6 +780,37 @@ class LinkPickerScreen(ModalScreen[dict[str, str] | None]):
         if link_list.index is None or not self.links:
             return None
         return self.links[link_list.index]
+
+
+class FileViewerScreen(ModalScreen[None]):
+    """Read-only preview for a Drive file."""
+
+    BINDINGS = [("escape", "close_viewer", "Close"), ("q", "close_viewer", "Close")]
+
+    def __init__(self, title: str, subtitle: str, content: str) -> None:
+        super().__init__()
+        self.title = title
+        self.subtitle = subtitle
+        self.content = content
+
+    def compose(self) -> ComposeResult:
+        with Container(id="file-viewer-modal", classes="modal-window"):
+            yield Static(self.title, classes="modal-title")
+            yield Static(self.subtitle, classes="modal-subtitle")
+            with FocusableScrollableContainer(id="file-viewer-body"):
+                yield Static(self.content, id="file-viewer-content")
+            with Horizontal(classes="modal-actions"):
+                yield Button("Close", variant="primary", id="file-viewer-close")
+
+    def on_mount(self) -> None:
+        self.query_one("#file-viewer-body", FocusableScrollableContainer).focus()
+
+    def action_close_viewer(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "file-viewer-close":
+            self.dismiss(None)
 
 
 class CreateDocumentScreen(ModalScreen[dict[str, str] | None]):
@@ -2269,7 +2310,8 @@ class DriveView(ModuleView):
             self.app.update_status(f"Drive: {self.module.list_label()}")
             self.action_refresh()
             return
-        super().open_record(key)
+        self.current_key = key
+        self.app.open_drive_record(record)
 
 
 class Workspace(App):
@@ -2516,7 +2558,7 @@ class Workspace(App):
         border: tall #343434;
     }
 
-    ProfilePickerScreen, ComposeEmailScreen, CreateEventScreen, CreateTaskScreen, EditTaskScreen, ConfirmDeleteScreen, DeleteCalendarEventScreen, LabelEditorScreen, GmailSearchScreen, CreateDocumentScreen, EditDocumentScreen, EditSheetScreen {
+    ProfilePickerScreen, ComposeEmailScreen, CreateEventScreen, CreateTaskScreen, EditTaskScreen, FileViewerScreen, ConfirmDeleteScreen, DeleteCalendarEventScreen, LabelEditorScreen, GmailSearchScreen, CreateDocumentScreen, EditDocumentScreen, EditSheetScreen {
         align: center middle;
     }
 
@@ -2533,6 +2575,23 @@ class Workspace(App):
         width: 118;
         height: 88%;
         max-width: 96%;
+    }
+
+    #file-viewer-modal {
+        width: 120;
+        height: 90%;
+        max-width: 96%;
+    }
+
+    #file-viewer-body {
+        height: 1fr;
+        margin-bottom: 1;
+        border: tall #343434;
+        padding: 0 1;
+    }
+
+    #file-viewer-content {
+        width: 1fr;
     }
 
     #sheet-edit-modal {
@@ -3127,6 +3186,29 @@ class Workspace(App):
         self.update_status("Loading email links...")
         self._load_email_links(gmail_module, gmail_view, record)
 
+    def open_drive_record(self, record: Record) -> None:
+        if record.raw.get("navigate_up") or record.subtitle == "Folder":
+            return
+        mime_type = str(record.raw.get("mimeType", "") or "")
+        if is_google_doc_mime(mime_type):
+            docs_module = self._any_docs_module()
+            if docs_module is None:
+                self.update_status("Drive open failed: Docs module unavailable")
+                return
+            self.update_status("Loading document editor...")
+            self._load_doc_editor(docs_module, record)
+            return
+        if is_google_sheet_mime(mime_type):
+            sheets_module = self._any_sheets_module()
+            if sheets_module is None:
+                self.update_status("Drive open failed: Sheets module unavailable")
+                return
+            self.update_status("Loading sheet editor...")
+            self._load_sheet_editor(sheets_module, record)
+            return
+        self.update_status("Loading file preview...")
+        self._load_drive_file_preview(record)
+
     def action_next_module(self) -> None:
         module_list = self.query_one(ListView)
         if module_list.index is None:
@@ -3205,9 +3287,21 @@ class Workspace(App):
                 return module
         return None
 
+    def _any_docs_module(self) -> DocsModule | None:
+        for module in self.modules:
+            if isinstance(module, DocsModule):
+                return module
+        return None
+
     def _current_sheets_module(self) -> SheetsModule | None:
         for module in self.modules:
             if module.id == self.current_module_id and isinstance(module, SheetsModule):
+                return module
+        return None
+
+    def _any_sheets_module(self) -> SheetsModule | None:
+        for module in self.modules:
+            if isinstance(module, SheetsModule):
                 return module
         return None
 
@@ -3463,9 +3557,9 @@ class Workspace(App):
         if result is None:
             self.update_status("Document edit cancelled")
             return
-        docs_module = self._current_docs_module()
+        docs_module = self._current_docs_module() or self._any_docs_module()
         if docs_module is None:
-            self.update_status("Edit doc is only available in Docs")
+            self.update_status("Edit doc is only available in Docs and Drive")
             return
         self.update_status("Saving document...")
         self._save_doc(docs_module, record.key, result["body"])
@@ -3474,9 +3568,9 @@ class Workspace(App):
         if result is None:
             self.update_status("Sheet edit cancelled")
             return
-        sheets_module = self._current_sheets_module()
+        sheets_module = self._current_sheets_module() or self._any_sheets_module()
         if sheets_module is None:
-            self.update_status("Edit is only available in Docs, Sheets, and Tasks")
+            self.update_status("Edit sheet is only available in Sheets and Drive")
             return
         self.update_status("Saving sheet...")
         self._save_sheet(
@@ -3719,6 +3813,90 @@ class Workspace(App):
         )
 
     @work(thread=True, exclusive=True)
+    def _load_drive_file_preview(self, record: Record) -> None:
+        metadata: dict[str, object] = {}
+        name = record.title
+        mime_type = str(record.raw.get("mimeType", "") or "")
+        try:
+            metadata_response = self.client.run(
+                "drive",
+                "files",
+                "get",
+                params={
+                    "fileId": record.key,
+                    "supportsAllDrives": True,
+                },
+            )
+            if not isinstance(metadata_response, dict):
+                raise ValueError("Unexpected Drive metadata response.")
+            metadata = metadata_response
+            name = str(metadata.get("name", record.title) or record.title)
+            mime_type = str(metadata.get("mimeType", mime_type) or mime_type)
+            payload = self._download_drive_preview_bytes(record.key, mime_type, metadata)
+            preview_text = render_binary_preview(name=name, mime_type=mime_type, data=payload, metadata=metadata)
+        except GwsError as exc:
+            preview_text = render_unavailable_preview(
+                name=name,
+                mime_type=mime_type,
+                reason=f"Drive preview failed: {exc.message}",
+                metadata=metadata or dict(record.raw),
+            )
+            self.call_from_thread(self._show_file_viewer, name, mime_type, preview_text)
+            return
+        except ValueError as exc:
+            preview_text = render_unavailable_preview(
+                name=name,
+                mime_type=mime_type,
+                reason=str(exc),
+                metadata=metadata or dict(record.raw),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Drive preview failed: {exc}")
+            return
+        self.call_from_thread(self._show_file_viewer, name, mime_type, preview_text)
+
+    def _show_file_viewer(self, title: str, mime_type: str, content: str) -> None:
+        self.push_screen(FileViewerScreen(title=title, subtitle=mime_type or "Unknown type", content=content))
+        self.update_status("Drive file opened")
+
+    def _download_drive_preview_bytes(self, file_id: str, mime_type: str, metadata: dict[str, object]) -> bytes:
+        size_value = str(metadata.get("size", "") or "").strip()
+        if size_value.isdigit() and int(size_value) > MAX_INLINE_FILE_BYTES:
+            raise ValueError(
+                f"File is {size_value} bytes; inline preview limit is {MAX_INLINE_FILE_BYTES} bytes."
+            )
+        if is_google_workspace_mime(mime_type):
+            export_mime_type = self._workspace_export_mime_type(mime_type)
+            if not export_mime_type:
+                raise ValueError("This Google Workspace file type is not yet supported for inline preview.")
+            return self.client.run_binary(
+                "drive",
+                "files",
+                "export",
+                params={
+                    "fileId": file_id,
+                    "mimeType": export_mime_type,
+                },
+            )
+        return self.client.run_binary(
+            "drive",
+            "files",
+            "get",
+            params={
+                "fileId": file_id,
+                "supportsAllDrives": True,
+                "alt": "media",
+            },
+        )
+
+    def _workspace_export_mime_type(self, mime_type: str) -> str:
+        if mime_type == GOOGLE_SLIDE_MIME:
+            return "text/plain"
+        if mime_type == GOOGLE_DRAWING_MIME:
+            return "image/png"
+        return ""
+
+    @work(thread=True, exclusive=True)
     def _save_doc(self, docs_module: DocsModule, document_id: str, body: str) -> None:
         try:
             docs_module.update_document_text(self.client, document_id=document_id, body=body)
@@ -3730,6 +3908,7 @@ class Workspace(App):
             return
         self.call_from_thread(self.update_status, "Document saved")
         self.call_from_thread(self.module_views["docs"].action_refresh)
+        self.call_from_thread(self.module_views["drive"].action_refresh)
 
     @work(thread=True, exclusive=True)
     def _create_task(
@@ -3829,6 +4008,7 @@ class Workspace(App):
             return
         self.call_from_thread(self.update_status, "Sheet saved")
         self.call_from_thread(self.module_views["sheets"].action_refresh)
+        self.call_from_thread(self.module_views["drive"].action_refresh)
 
     @work(thread=True, exclusive=True)
     def _apply_today_draft(self, today_module: TodayModule, draft_id: str) -> None:
