@@ -1432,6 +1432,99 @@ class TasksModuleTest(unittest.TestCase):
         self.assertIn("completed", client.calls[-1][4])
         self.assertTrue(record.raw["completed"])
 
+    def test_update_task_uses_patch_endpoint(self) -> None:
+        client = StubClient()
+        module = TasksModule()
+        client.add(("tasks", "tasks", "patch", "[('task', 'task-1'), ('tasklist', 'list-1')]"), {"id": "task-1"})
+        record = Record(
+            key="list-1:task-1",
+            columns=("Buy milk", "Personal", "Mar 09"),
+            title="Buy milk",
+            subtitle="Personal",
+            raw={
+                "task": {"title": "Buy milk", "notes": "2% only", "due": "2026-03-09T00:00:00Z"},
+                "tasklist_id": "list-1",
+                "task_id": "task-1",
+                "completed": False,
+            },
+        )
+
+        response = module.update_task(
+            client,
+            record,
+            title="Buy oat milk",
+            notes="Unsweetened",
+            due_text="2026-03-10",
+        )  # type: ignore[arg-type]
+
+        self.assertEqual(response["id"], "task-1")
+        self.assertEqual(client.calls[-1][2], ("tasks", "patch"))
+        self.assertEqual(client.calls[-1][4]["title"], "Buy oat milk")
+        self.assertEqual(client.calls[-1][4]["notes"], "Unsweetened")
+        self.assertEqual(client.calls[-1][4]["due"], "2026-03-10T00:00:00Z")
+        self.assertEqual(record.title, "Buy oat milk")
+        self.assertEqual(record.raw["task"]["title"], "Buy oat milk")
+        self.assertEqual(record.raw["task"]["notes"], "Unsweetened")
+        self.assertEqual(record.raw["task"]["due"], "2026-03-10T00:00:00Z")
+
+    def test_update_task_omits_due_when_due_text_empty(self) -> None:
+        client = StubClient()
+        module = TasksModule()
+        client.add(("tasks", "tasks", "patch", "[('task', 'task-1'), ('tasklist', 'list-1')]"), {"id": "task-1"})
+        record = Record(
+            key="list-1:task-1",
+            columns=("Buy milk", "Personal", "Mar 09"),
+            title="Buy milk",
+            subtitle="Personal",
+            raw={
+                "task": {"title": "Buy milk", "notes": "2% only", "due": "2026-03-09T00:00:00Z"},
+                "tasklist_id": "list-1",
+                "task_id": "task-1",
+                "completed": False,
+            },
+        )
+
+        module.update_task(client, record, title="Buy milk", notes="", due_text="")  # type: ignore[arg-type]
+
+        self.assertNotIn("due", client.calls[-1][4])
+        self.assertEqual(client.calls[-1][4]["notes"], "")
+        self.assertEqual(record.raw["task"]["due"], "2026-03-09T00:00:00Z")
+
+    def test_update_task_uses_target_profile_from_record(self) -> None:
+        client = StubClient(config_dir="/profiles/personal")
+        module = TasksModule()
+        module.configure_profiles(
+            "personal",
+            [
+                GwsProfile(name="personal", config_dir="/profiles/personal"),
+                GwsProfile(name="school", config_dir="/profiles/school"),
+            ],
+            ["personal", "school"],
+        )
+        client.add_for_config(
+            "/profiles/school",
+            ("tasks", "tasks", "patch", "[('task', 'task-2'), ('tasklist', 'list-2')]"),
+            {"id": "task-2"},
+        )
+        record = Record(
+            key="school::list-2:task-2",
+            columns=("Study", "School (school)", "No date"),
+            title="Study",
+            subtitle="School (school)",
+            raw={
+                "task": {"title": "Study"},
+                "tasklist_id": "list-2",
+                "task_id": "task-2",
+                "profile_name": "school",
+            },
+        )
+
+        response = module.update_task(client, record, title="Study chapter 4")  # type: ignore[arg-type]
+
+        self.assertEqual(response["id"], "task-2")
+        self.assertEqual(client.calls[-1][0], "/profiles/school")
+        self.assertEqual(client.calls[-1][2], ("tasks", "patch"))
+
     def test_fetch_records_merges_synced_profiles(self) -> None:
         client = StubClient(config_dir="/profiles/personal")
         module = TasksModule()

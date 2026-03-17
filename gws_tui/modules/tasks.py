@@ -303,6 +303,43 @@ class TasksModule(WorkspaceModule):
         record.raw["task"] = task
         return response
 
+    def update_task(
+        self,
+        client: GwsClient,
+        record: Record,
+        title: str,
+        notes: str = "",
+        due_text: str = "",
+    ) -> dict:
+        cleaned_title = title.strip()
+        if not cleaned_title:
+            raise ValueError("Task title is required")
+        body: dict[str, Any] = {
+            "title": cleaned_title,
+            "notes": notes.strip(),
+        }
+        if due_text.strip():
+            body["due"] = parse_due_date(due_text)
+        target_client = self._client_for_profile(client, record.raw.get("profile_name"))
+        response = target_client.run(
+            "tasks",
+            "tasks",
+            "patch",
+            params={
+                "tasklist": record.raw["tasklist_id"],
+                "task": record.raw["task_id"],
+            },
+            body=body,
+        )
+        task = dict(record.raw.get("task", {}))
+        task["title"] = body["title"]
+        task["notes"] = body["notes"]
+        if "due" in body:
+            task["due"] = body["due"]
+        record.title = cleaned_title
+        record.raw["task"] = task
+        return response
+
     def reset_state(self) -> None:
         self.selected_tasklist_id = ""
         self.selected_tasklist_name = "All Tasks"

@@ -482,6 +482,62 @@ class CreateTaskScreen(ModalScreen[dict[str, str] | None]):
         )
 
 
+def task_due_input_value(value: str) -> str:
+    cleaned = value.strip()
+    if len(cleaned) >= 10 and cleaned[4] == "-" and cleaned[7] == "-":
+        return cleaned[:10]
+    return cleaned
+
+
+class EditTaskScreen(ModalScreen[dict[str, str] | None]):
+    """Edit a Google Task."""
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, tasklist_name: str, title: str, due: str, notes: str) -> None:
+        super().__init__()
+        self.tasklist_name = tasklist_name
+        self.title = title
+        self.due = due
+        self.notes = notes
+
+    def compose(self) -> ComposeResult:
+        with Container(id="task-modal", classes="modal-window"):
+            yield Static("Edit Task", classes="modal-title")
+            yield Static(f"Task list: {self.tasklist_name}", classes="modal-subtitle")
+            yield Input(value=self.title, placeholder="Task title", id="task-title")
+            yield Input(value=self.due, placeholder="Optional due date: YYYY-MM-DD", id="task-due")
+            yield TextArea(self.notes, id="task-notes")
+            with Horizontal(classes="modal-actions"):
+                yield Button("Cancel", id="task-edit-cancel")
+                yield Button("Save", variant="primary", id="task-edit-save")
+
+    def on_mount(self) -> None:
+        self.query_one("#task-title", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "task-edit-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id != "task-edit-save":
+            return
+        title = self.query_one("#task-title", Input).value.strip()
+        if not title:
+            self.app.update_status("Task: title is required")
+            self.query_one("#task-title", Input).focus()
+            return
+        self.dismiss(
+            {
+                "title": title,
+                "due": self.query_one("#task-due", Input).value.strip(),
+                "notes": self.query_one("#task-notes", TextArea).text.strip(),
+            }
+        )
+
+
 class DeleteCalendarEventScreen(ModalScreen[str | None]):
     """Choose a calendar event from the selected day to delete."""
 
@@ -2460,7 +2516,7 @@ class Workspace(App):
         border: tall #343434;
     }
 
-    ProfilePickerScreen, ComposeEmailScreen, CreateEventScreen, CreateTaskScreen, ConfirmDeleteScreen, DeleteCalendarEventScreen, LabelEditorScreen, GmailSearchScreen, CreateDocumentScreen, EditDocumentScreen, EditSheetScreen {
+    ProfilePickerScreen, ComposeEmailScreen, CreateEventScreen, CreateTaskScreen, EditTaskScreen, ConfirmDeleteScreen, DeleteCalendarEventScreen, LabelEditorScreen, GmailSearchScreen, CreateDocumentScreen, EditDocumentScreen, EditSheetScreen {
         align: center middle;
     }
 
@@ -2739,7 +2795,7 @@ class Workspace(App):
         if action == "create_doc":
             return self.current_module_id == "docs"
         if action == "edit_doc":
-            return self.current_module_id in {"docs", "sheets"}
+            return self.current_module_id in {"docs", "sheets", "tasks"}
         if action == "toggle_task_complete":
             return self.current_module_id == "tasks"
         if action in {"previous_calendar_month", "next_calendar_month"}:
@@ -2954,7 +3010,7 @@ class Workspace(App):
         if self.current_module_id == "docs":
             docs_module = self._current_docs_module()
             if docs_module is None:
-                self.update_status("Edit is only available in Docs and Sheets")
+                self.update_status("Edit is only available in Docs, Sheets, and Tasks")
                 return
             record = self.module_views[self.current_module_id].current_record()
             if record is None:
@@ -2966,7 +3022,7 @@ class Workspace(App):
         if self.current_module_id == "sheets":
             sheets_module = self._current_sheets_module()
             if sheets_module is None:
-                self.update_status("Edit is only available in Docs and Sheets")
+                self.update_status("Edit is only available in Docs, Sheets, and Tasks")
                 return
             record = self.module_views[self.current_module_id].current_record()
             if record is None:
@@ -2975,7 +3031,27 @@ class Workspace(App):
             self.update_status("Loading sheet editor...")
             self._load_sheet_editor(sheets_module, record)
             return
-        self.update_status("Edit is only available in Docs and Sheets")
+        if self.current_module_id == "tasks":
+            tasks_module = self._current_tasks_module()
+            if tasks_module is None:
+                self.update_status("Edit is only available in Docs, Sheets, and Tasks")
+                return
+            record = self.module_views[self.current_module_id].current_record()
+            if record is None:
+                self.update_status("Edit task: no task selected")
+                return
+            task = record.raw.get("task", {})
+            self.push_screen(
+                EditTaskScreen(
+                    record.columns[1],
+                    str(task.get("title", record.title) or record.title),
+                    task_due_input_value(str(task.get("due", "") or "")),
+                    str(task.get("notes", "") or ""),
+                ),
+                lambda result: self._handle_edit_task_result(result, record),
+            )
+            return
+        self.update_status("Edit is only available in Docs, Sheets, and Tasks")
 
     def action_delete_email(self) -> None:
         if self.current_module_id == "calendar":
@@ -3400,7 +3476,7 @@ class Workspace(App):
             return
         sheets_module = self._current_sheets_module()
         if sheets_module is None:
-            self.update_status("Edit is only available in Docs and Sheets")
+            self.update_status("Edit is only available in Docs, Sheets, and Tasks")
             return
         self.update_status("Saving sheet...")
         self._save_sheet(
@@ -3409,6 +3485,23 @@ class Workspace(App):
             sheet_title=context["sheet_title"],
             clear_range=context["clear_range"],
             body=result["body"],
+        )
+
+    def _handle_edit_task_result(self, result: dict[str, str] | None, record: Record) -> None:
+        if result is None:
+            self.update_status("Task edit cancelled")
+            return
+        tasks_module = self._current_tasks_module()
+        if tasks_module is None:
+            self.update_status("Edit task is only available in Tasks")
+            return
+        self.update_status("Saving task...")
+        self._edit_task(
+            tasks_module,
+            record=record,
+            title=result["title"],
+            notes=result["notes"],
+            due_text=result["due"],
         )
 
     def _handle_reply_result(self, result: dict[str, str] | None, reply_context: dict[str, str]) -> None:
@@ -3680,6 +3773,35 @@ class Workspace(App):
             self.call_from_thread(self.update_status, f"Task update failed: {exc}")
             return
         self.call_from_thread(self.update_status, "Task completed" if completed else "Task reopened")
+        self.call_from_thread(self.module_views["tasks"].action_refresh)
+
+    @work(thread=True, exclusive=True)
+    def _edit_task(
+        self,
+        tasks_module: TasksModule,
+        record: Record,
+        title: str,
+        notes: str,
+        due_text: str,
+    ) -> None:
+        try:
+            tasks_module.update_task(
+                self.client,
+                record=record,
+                title=title,
+                notes=notes,
+                due_text=due_text,
+            )
+        except ValueError as exc:
+            self.call_from_thread(self.update_status, f"Task update failed: {exc}")
+            return
+        except GwsError as exc:
+            self.call_from_thread(self.update_status, f"Task update failed: {exc.message}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self.update_status, f"Task update failed: {exc}")
+            return
+        self.call_from_thread(self.update_status, "Task updated")
         self.call_from_thread(self.module_views["tasks"].action_refresh)
 
     @work(thread=True, exclusive=True)

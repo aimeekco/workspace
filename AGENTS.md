@@ -48,7 +48,7 @@ Keep this order aligned with:
 - `n`
   - Docs: create doc
 - `w`
-  - Docs / Sheets: edit
+  - Docs / Sheets / Tasks: edit
 - `r`
   - Today: regenerate briefing
 - `Shift+A`
@@ -83,7 +83,7 @@ Keep this order aligned with:
 
 ### Tasks
 - Uses a dedicated three-pane view
-- Supports task-list filtering, task creation, and complete/uncomplete
+- Supports task-list filtering, task creation, task editing, and complete/uncomplete
 - Due date input is `YYYY-MM-DD`
 
 ### Drive
