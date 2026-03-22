@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import unittest
 
-from gws_tui.app import format_chat_action_preview
+from gws_tui.app import Workspace, format_chat_action_preview
 from gws_tui.gemini_chat import GeminiChatAction
 
 
 class ChatActionPreviewTest(unittest.TestCase):
+    def test_workspace_defaults_to_nord_theme(self) -> None:
+        app = Workspace()
+
+        self.assertEqual(app.theme, "nord")
+
     def test_calendar_preview_shows_summary_start_and_duration(self) -> None:
         preview = format_chat_action_preview(
             GeminiChatAction(

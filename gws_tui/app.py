@@ -2493,6 +2493,7 @@ class Workspace(App):
     """Unified Google Workspace TUI backed by gws."""
 
     TITLE = "workspace"
+    theme = "nord"
 
     CSS = """
     App {
