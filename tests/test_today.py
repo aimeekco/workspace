@@ -186,6 +186,26 @@ class TodayModuleTest(unittest.TestCase):
 
             self.assertEqual(planner.calls, 2)
 
+    def test_fetch_dashboard_includes_overview_record_with_summary_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            context = WorkspaceContext(profile_name="default", day_iso="2026-03-09", records=[])
+            brief = TodayBrief(
+                summary="Focus on the launch checklist first.",
+                source="gemini",
+                warnings=["Mailbox data is partial."],
+            )
+            module = TodayModule(
+                aggregator=FakeAggregator(context),
+                planner=FakePlanner(brief),
+                cache=TodayCache(Path(tmp_dir) / ".today-cache.json"),
+            )
+
+            dashboard = module.fetch_dashboard(client=None)  # type: ignore[arg-type]
+
+            overview = dashboard.section_records["overview"][0]
+            self.assertIn("Focus on the launch checklist first.", str(overview.raw["detail"]))
+            self.assertIn("Mailbox data is partial.", str(overview.raw["detail"]))
+
     def test_remove_draft_updates_current_dashboard_and_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             context = WorkspaceContext(profile_name="default", day_iso="2026-03-09", records=[])

@@ -30,6 +30,7 @@ from gws_tui.file_preview import (
     render_binary_preview,
     render_unavailable_preview,
 )
+from gws_tui.gemini_chat import GeminiChatAction, GeminiChatMessage, GeminiChatResponse, GeminiChatService
 from gws_tui.models import Record
 from gws_tui.modules import WorkspaceModule, built_in_modules
 from gws_tui.modules.calendar import CalendarDetail, CalendarModule
@@ -38,7 +39,7 @@ from gws_tui.modules.docs import DocsModule
 from gws_tui.modules.gmail import GmailDetail, GmailModule
 from gws_tui.modules.sheets import SheetsModule, column_label, grid_text_to_values, values_to_grid_text
 from gws_tui.modules.tasks import TasksModule
-from gws_tui.modules.today import SECTION_LABELS, SECTION_ORDER, TodayDashboard, TodayModule
+from gws_tui.modules.today import TodayDashboard, TodayModule
 from gws_tui.profiles import (
     GwsProfile,
     GwsProfileDiagnostic,
@@ -61,6 +62,81 @@ MODULE_ACCENTS = {
 
 PROFILE_DIAGNOSTICS_TTL_SECONDS = 30.0
 MAX_INLINE_FILE_BYTES = 4 * 1024 * 1024
+
+
+def format_chat_action_preview(action: GeminiChatAction) -> str:
+    payload = action.payload or {}
+    if action.kind == "task_create":
+        lines = [
+            "Create Task Draft",
+            "",
+            f"Title: {str(payload.get('title', '')).strip() or action.title}",
+        ]
+        notes = str(payload.get("notes", "")).strip()
+        due_text = str(payload.get("due_text", "")).strip()
+        tasklist_id = str(payload.get("tasklist_id", "")).strip()
+        if due_text:
+            lines.append(f"Due: {due_text}")
+        if tasklist_id:
+            lines.append(f"Task List: {tasklist_id}")
+        if notes:
+            lines.extend(["", "Notes", "", notes])
+        return "\n".join(lines).strip()
+
+    if action.kind == "calendar_event_create":
+        lines = [
+            "Calendar Event Draft",
+            "",
+            f"Summary: {str(payload.get('summary', '')).strip() or action.title}",
+            f"Start: {str(payload.get('start_text', '')).strip()}",
+        ]
+        end_text = str(payload.get("end_text", "")).strip()
+        duration_text = str(payload.get("duration_text", "")).strip()
+        calendar_id = str(payload.get("calendar_id", "")).strip()
+        location = str(payload.get("location", "")).strip()
+        description = str(payload.get("description", "")).strip() or action.detail.strip()
+        if end_text:
+            lines.append(f"End: {end_text}")
+        elif duration_text:
+            lines.append(f"Duration: {duration_text}")
+        if calendar_id:
+            lines.append(f"Calendar: {calendar_id}")
+        if location:
+            lines.append(f"Location: {location}")
+        if description:
+            lines.extend(["", "Description", "", description])
+        return "\n".join(lines).strip()
+
+    if action.kind == "doc_create":
+        title = str(payload.get("title", "")).strip() or action.title
+        body = str(payload.get("body", "")).strip()
+        lines = [
+            "Document Draft",
+            "",
+            f"Title: {title}",
+        ]
+        if body:
+            lines.extend(["", "Body", "", body])
+        return "\n".join(lines).strip()
+
+    if action.kind == "gmail_draft":
+        to = str(payload.get("to", "")).strip()
+        cc = str(payload.get("cc", "")).strip()
+        subject = str(payload.get("subject", "")).strip() or action.title
+        body = str(payload.get("body", "")).strip()
+        lines = [
+            "Email Draft",
+            "",
+            f"To: {to}",
+            f"Subject: {subject}",
+        ]
+        if cc:
+            lines.append(f"Cc: {cc}")
+        if body:
+            lines.extend(["", "Body", "", body])
+        return "\n".join(lines).strip()
+
+    return action.title
 
 
 class PassiveScrollableContainer(ScrollableContainer):
@@ -1586,7 +1662,7 @@ class ModuleView(PassiveScrollableContainer):
 
 
 class TodayView(PassiveScrollableContainer):
-    """Gemini-powered workspace dashboard."""
+    """Gemini-powered workspace dashboard and chat."""
 
     module: TodayModule
 
@@ -1594,37 +1670,39 @@ class TodayView(PassiveScrollableContainer):
         super().__init__(id=f"view-{module.id}")
         self.module = module
         self.client = client
-        self.section_records: dict[str, list[Record]] = {}
-        self.records: dict[str, Record] = {}
-        self.current_key: str | None = None
-        self.current_section = SECTION_ORDER[0]
-        self.detail_label = "Preview"
+        self.dashboard: TodayDashboard | None = None
+        self.active_tab = "overview"
+        self.chat_service = GeminiChatService()
+        self.chat_history: list[GeminiChatMessage] = []
+        self.chat_pending = False
+        self.action_pending = False
+        self.proposed_action: GeminiChatAction | None = None
         self.loaded = False
 
     def compose(self) -> ComposeResult:
         with Horizontal(classes="module-heading"):
             yield Static(self.module.title, id="title-today", classes="module-title")
             yield Static(self.module.badge(), id="badge-today", classes="module-badge")
-        with Horizontal(classes="module-body"):
-            with Container(id="pane-sections-today", classes="pane pane-mailboxes"):
-                yield Static("Sections", classes="pane-title")
-                yield ListView(id="section-list-today")
-            with Container(classes="pane pane-mail"):
-                yield Static(SECTION_LABELS[self.current_section], id="section-heading-today", classes="pane-title")
-                yield DataTable(id="table-today")
-            with Container(classes="pane pane-mail-detail"):
-                yield Static("Preview", id="detail-label-today", classes="pane-title")
-                with FocusableScrollableContainer(classes="detail-container"):
-                    yield Static("Select a section to inspect today's briefing.", id="detail-today")
+        with Vertical(classes="module-body"):
+            with Horizontal(id="today-tab-bar"):
+                yield Button("Overview", id="today-tab-overview", classes="today-tab-button")
+                yield Button("Gemini Chat", id="today-tab-chat", classes="today-tab-button")
+            with ContentSwitcher(initial="today-panel-overview", id="today-content-switcher"):
+                with Container(id="today-panel-overview", classes="today-panel"):
+                    with FocusableScrollableContainer(id="today-overview-container", classes="detail-container"):
+                        yield Static("", id="today-overview")
+                with Vertical(id="today-panel-chat", classes="today-panel"):
+                    with FocusableScrollableContainer(id="today-chat-transcript-container", classes="detail-container"):
+                        yield Static("", id="today-chat-transcript")
+                    with Horizontal(id="today-chat-entry"):
+                        yield Input(placeholder="Ask Gemini about your schedule, inbox, or priorities...", id="today-chat-input")
+                        yield Button("Approve Draft", id="today-chat-execute")
+                        yield Button("Send", id="today-chat-send", variant="primary")
 
     def on_mount(self) -> None:
-        table = self.query_one("#table-today", DataTable)
-        table.cursor_type = "row"
-        table.zebra_stripes = True
-        table.add_column("Item", width=38)
-        table.add_column("Source", width=18)
-        table.add_column("When", width=18)
-        table.show_header = True
+        self._set_active_tab("overview")
+        self._render_chat_transcript()
+        self._refresh_chat_buttons()
 
     def load_if_needed(self) -> None:
         if not self.loaded:
@@ -1632,17 +1710,15 @@ class TodayView(PassiveScrollableContainer):
 
     def action_refresh(self) -> None:
         self.loaded = True
-        self.detail_label = "Preview"
-        self._set_detail_label("Preview")
-        self._set_detail_text(self._state_text("Loading Today", self.module.loading_message()))
+        self.dashboard = None
+        self._set_overview_text(self._state_text("Loading Today", self.module.loading_message()), "Overview")
         self.app.update_status("Loading today...")
         self._load_dashboard(False)
 
     def action_regenerate(self) -> None:
         self.loaded = True
-        self.detail_label = "Preview"
-        self._set_detail_label("Preview")
-        self._set_detail_text(self._state_text("Refreshing Today", "Ignoring the cache and rebuilding the daily brief..."))
+        self.dashboard = None
+        self._set_overview_text(self._state_text("Refreshing Today", "Ignoring the cache and rebuilding the daily brief..."), "Overview")
         self.app.update_status("Regenerating today...")
         self._load_dashboard(True)
 
@@ -1659,78 +1735,11 @@ class TodayView(PassiveScrollableContainer):
         self.app.call_from_thread(self._render_dashboard, dashboard)
 
     def _render_dashboard(self, dashboard: TodayDashboard) -> None:
-        self.section_records = {section: list(dashboard.section_records.get(section, [])) for section in SECTION_ORDER}
-        self._render_sections()
-        self._render_section_records()
+        self.dashboard = dashboard
+        self._render_overview(dashboard)
         self.app.refresh_bindings()
         warnings = f", {len(dashboard.warnings)} warnings" if dashboard.warnings else ""
         self.app.update_status(f"Today: loaded from {dashboard.source}{warnings}")
-
-    def _render_sections(self) -> None:
-        section_list = self.query_one("#section-list-today", ListView)
-        section_list.clear()
-        selected_index = 0
-        for index, section in enumerate(SECTION_ORDER):
-            count = len(self.section_records.get(section, []))
-            label = f"{SECTION_LABELS[section]} ({count})"
-            section_list.append(ListItem(Static(label), name=section))
-            if section == self.current_section:
-                selected_index = index
-        section_list.index = selected_index
-        self._apply_section_width()
-
-    def _apply_section_width(self) -> None:
-        longest = max([len("Sections"), *(len(f"{SECTION_LABELS[section]} ({len(self.section_records.get(section, []))})") for section in SECTION_ORDER)], default=len("Sections"))
-        self.query_one("#pane-sections-today", Container).styles.width = max(18, longest + 4)
-
-    def _render_section_records(self) -> None:
-        self.query_one("#section-heading-today", Static).update(SECTION_LABELS[self.current_section])
-        records = self.section_records.get(self.current_section, [])
-        self.records = {record.key: record for record in records}
-        table = self.query_one("#table-today", DataTable)
-        table.clear()
-        if not records:
-            self.current_key = None
-            self._set_detail_label("Preview")
-            self._set_detail_text(self._state_text("No items", f"{SECTION_LABELS[self.current_section]} is empty."))
-            self.app.refresh_bindings()
-            return
-        for record in records:
-            table.add_row(*record.columns, key=record.key)
-        table.move_cursor(row=0, column=0)
-        self.show_preview(records[0].key)
-
-    def show_preview(self, key: str) -> None:
-        if key not in self.records:
-            return
-        self.current_key = key
-        record = self.records[key]
-        self._set_detail_label("Preview")
-        self._set_detail_text(record.preview or record.title)
-        self.app.refresh_bindings()
-        self.app.update_status(f"Today: previewing {record.title}")
-
-    def open_record(self, key: str) -> None:
-        if key not in self.records:
-            return
-        self.current_key = key
-        record = self.records[key]
-        self._set_detail_label("Detail")
-        self._set_detail_text(str(record.raw.get("detail", record.preview or record.title)))
-        self.app.refresh_bindings()
-        self.app.update_status(f"Today: {record.title}")
-
-    def current_record(self) -> Record | None:
-        if self.current_key is None:
-            return None
-        return self.records.get(self.current_key)
-
-    def current_draft_id(self) -> str | None:
-        record = self.current_record()
-        if record is None:
-            return None
-        draft_id = record.raw.get("draft_id")
-        return str(draft_id) if draft_id else None
 
     def sync_from_module(self) -> None:
         dashboard = self.module.current_dashboard
@@ -1739,13 +1748,19 @@ class TodayView(PassiveScrollableContainer):
             return
         self._render_dashboard(dashboard)
 
-    def _set_detail_label(self, value: str) -> None:
-        self.detail_label = value
-        self.query_one("#detail-label-today", Static).update(value)
+    def current_draft_id(self) -> str | None:
+        return None
 
-    def _set_detail_text(self, value: str) -> None:
-        self.query_one("#detail-today", Static).update(
-            Panel(Text(value), title=self.module.title, subtitle=self.detail_label, border_style=MODULE_ACCENTS["today"], box=box.ROUNDED)
+    def _render_overview(self, dashboard: TodayDashboard) -> None:
+        overview_record = next(iter(dashboard.section_records.get("overview", [])), None)
+        detail = dashboard.summary
+        if overview_record is not None:
+            detail = str(overview_record.raw.get("detail", overview_record.preview or dashboard.summary))
+        self._set_overview_text(detail, f"Overview · {dashboard.source}")
+
+    def _set_overview_text(self, value: str, subtitle: str) -> None:
+        self.query_one("#today-overview", Static).update(
+            Panel(Text(value), title=self.module.title, subtitle=subtitle, border_style=MODULE_ACCENTS["today"], box=box.ROUNDED)
         )
 
     def _state_text(self, heading: str, message: str, hint: str = "") -> str:
@@ -1755,48 +1770,208 @@ class TodayView(PassiveScrollableContainer):
         return "\n".join(lines)
 
     def _handle_error(self, message: str) -> None:
-        self.records = {}
-        self.current_key = None
-        self._set_detail_label("Preview")
-        self._set_detail_text(self._state_text("Today request failed", message))
-        table = self.query_one("#table-today", DataTable)
-        table.clear()
+        self.dashboard = None
+        self._set_overview_text(self._state_text("Today request failed", message), "Overview")
         self.app.update_status("Today: request failed")
 
-    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        if event.data_table.id != "table-today" or event.row_key is None:
-            return
-        self.show_preview(str(event.row_key.value))
+    def _set_active_tab(self, tab: str) -> None:
+        self.active_tab = tab
+        self.query_one("#today-content-switcher", ContentSwitcher).current = f"today-panel-{tab}"
+        overview_button = self.query_one("#today-tab-overview", Button)
+        chat_button = self.query_one("#today-tab-chat", Button)
+        if tab == "overview":
+            overview_button.add_class("today-tab-active")
+            chat_button.remove_class("today-tab-active")
+        else:
+            chat_button.add_class("today-tab-active")
+            overview_button.remove_class("today-tab-active")
+        if tab == "chat":
+            self.query_one("#today-chat-input", Input).focus()
 
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if event.data_table.id != "table-today" or event.row_key is None:
+    def _submit_chat(self) -> None:
+        if self.chat_pending:
             return
-        self.open_record(str(event.row_key.value))
+        input_widget = self.query_one("#today-chat-input", Input)
+        prompt = input_widget.value.strip()
+        if not prompt:
+            return
+        history = list(self.chat_history)
+        self.chat_history.append(GeminiChatMessage(role="user", text=prompt))
+        self.chat_pending = True
+        self.proposed_action = None
+        input_widget.value = ""
+        self._set_active_tab("chat")
+        self._render_chat_transcript()
+        self._refresh_chat_buttons()
+        self.app.update_status("Gemini: generating reply...")
+        self._send_chat_message(history, prompt, self.module.current_context, self.module.current_brief)
 
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        if event.list_view.id != "section-list-today" or event.item is None:
+    @work(thread=True, exclusive=True)
+    def _send_chat_message(
+        self,
+        history: list[GeminiChatMessage],
+        prompt: str,
+        context,
+        brief,
+    ) -> None:
+        try:
+            response = self.chat_service.respond(history, prompt, context, brief)
+        except Exception as exc:  # noqa: BLE001
+            self.app.call_from_thread(self._handle_chat_error, str(exc))
             return
-        section = event.item.name or self.current_section
-        if section == self.current_section:
-            return
-        self.current_section = section
-        self._render_section_records()
+        self.app.call_from_thread(self._complete_chat, response)
 
-    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
-        if event.list_view.id != "section-list-today" or event.item is None:
+    def _complete_chat(self, response: GeminiChatResponse) -> None:
+        self.chat_pending = False
+        self.proposed_action = response.action
+        self.chat_history.append(GeminiChatMessage(role="assistant", text=response.reply, sources=response.sources))
+        self._render_chat_transcript()
+        self._refresh_chat_buttons()
+        self.app.update_status("Gemini: reply ready")
+
+    def _handle_chat_error(self, message: str) -> None:
+        self.chat_pending = False
+        self.proposed_action = None
+        self.chat_history.append(GeminiChatMessage(role="assistant", text=f"Gemini error: {message}"))
+        self._render_chat_transcript()
+        self._refresh_chat_buttons()
+        self.app.update_status("Gemini: request failed")
+
+    @work(thread=True, exclusive=True)
+    def _revise_after_action_error(
+        self,
+        history: list[GeminiChatMessage],
+        failed_action: GeminiChatAction,
+        error_message: str,
+        context,
+        brief,
+    ) -> None:
+        try:
+            response = self.chat_service.revise_after_action_error(history, failed_action, error_message, context, brief)
+        except Exception as exc:  # noqa: BLE001
+            self.app.call_from_thread(self._handle_chat_error, str(exc))
             return
-        section = event.item.name or self.current_section
-        if section == self.current_section:
+        self.app.call_from_thread(self._complete_chat, response)
+
+    def _render_chat_transcript(self) -> None:
+        if not self.chat_history and not self.chat_pending:
+            text = (
+                "Ask Gemini about today’s priorities, meetings, unread mail, or follow-ups.\n\n"
+                "Gemini can search the web for current external information and will show sources when it does.\n\n"
+                "You can also ask it to create a task, schedule an event, draft an email, or create a doc. "
+                "When it has enough detail, it will prepare a draft preview that you can approve."
+            )
+        else:
+            lines: list[str] = []
+            for message in self.chat_history:
+                speaker = "You" if message.role == "user" else "Gemini"
+                lines.append(f"{speaker}:")
+                lines.append(message.text)
+                if message.sources:
+                    lines.append("")
+                    lines.append("Sources:")
+                    for index, source in enumerate(message.sources, start=1):
+                        lines.append(f"{index}. {source.title}")
+                        lines.append(source.url)
+                lines.append("")
+            if self.chat_pending:
+                lines.append("Gemini:")
+                lines.append("Thinking...")
+            elif self.action_pending and self.proposed_action is not None:
+                lines.append("Approving draft:")
+                lines.append(self._action_label(self.proposed_action))
+                lines.append("")
+                lines.append(format_chat_action_preview(self.proposed_action))
+            elif self.proposed_action is not None:
+                lines.append("Draft preview:")
+                lines.append(self._action_label(self.proposed_action))
+                lines.append("")
+                lines.append(format_chat_action_preview(self.proposed_action))
+            text = "\n".join(lines).strip()
+        self.query_one("#today-chat-transcript", Static).update(
+            Panel(Text(text), title="Gemini Chat", subtitle="Workspace-aware", border_style=MODULE_ACCENTS["today"], box=box.ROUNDED)
+        )
+        self.call_after_refresh(self._scroll_chat_to_bottom)
+
+    def _scroll_chat_to_bottom(self) -> None:
+        self.query_one("#today-chat-transcript-container", FocusableScrollableContainer).scroll_end(animate=False)
+
+    def _refresh_chat_buttons(self) -> None:
+        execute_button = self.query_one("#today-chat-execute", Button)
+        execute_button.disabled = self.chat_pending or self.action_pending or self.proposed_action is None
+        if self.proposed_action is None:
+            execute_button.label = "Approve Draft"
+        elif self.action_pending:
+            execute_button.label = "Approving..."
+        else:
+            execute_button.label = "Approve Draft"
+
+    def _action_label(self, action: GeminiChatAction) -> str:
+        labels = {
+            "task_create": "Create task",
+            "calendar_event_create": "Create event",
+            "doc_create": "Create doc",
+            "gmail_draft": "Create draft",
+        }
+        return labels.get(action.kind, action.kind)
+
+    def chat_action_finished(self, message: str) -> None:
+        self.action_pending = False
+        self.proposed_action = None
+        self.chat_history.append(GeminiChatMessage(role="assistant", text=f"{message}\n\nDraft approved."))
+        self._render_chat_transcript()
+        self._refresh_chat_buttons()
+
+    def chat_action_failed(self, message: str) -> None:
+        failed_action = self.proposed_action
+        self.action_pending = False
+        self.proposed_action = None
+        self.chat_history.append(GeminiChatMessage(role="assistant", text=f"{message}\n\nRevising draft..."))
+        self.chat_pending = failed_action is not None
+        self._render_chat_transcript()
+        self._refresh_chat_buttons()
+        if failed_action is None:
             return
-        self.current_section = section
-        self._render_section_records()
+        self.app.update_status("Gemini: revising draft...")
+        self._revise_after_action_error(
+            list(self.chat_history),
+            failed_action,
+            message,
+            self.module.current_context,
+            self.module.current_brief,
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "today-tab-overview":
+            self._set_active_tab("overview")
+            return
+        if event.button.id == "today-tab-chat":
+            self._set_active_tab("chat")
+            return
+        if event.button.id == "today-chat-send":
+            self._submit_chat()
+            return
+        if event.button.id == "today-chat-execute":
+            if self.proposed_action is None or self.chat_pending or self.action_pending:
+                return
+            self.action_pending = True
+            self._render_chat_transcript()
+            self._refresh_chat_buttons()
+            self.app.update_status("Executing workspace action...")
+            self.app._execute_chat_action(self.proposed_action)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "today-chat-input":
+            return
+        self._submit_chat()
 
     def reset_state(self) -> None:
-        self.section_records = {}
-        self.records = {}
-        self.current_key = None
-        self.current_section = SECTION_ORDER[0]
-        self.detail_label = "Preview"
+        self.dashboard = None
+        self.active_tab = "overview"
+        self.chat_history = []
+        self.chat_pending = False
+        self.action_pending = False
+        self.proposed_action = None
         self.loaded = False
 
 
@@ -2462,6 +2637,43 @@ class Workspace(App):
         padding: 0 0 1 0;
     }
 
+    #today-tab-bar {
+        height: auto;
+        margin: 0 1 1 1;
+    }
+
+    .today-tab-button {
+        margin-right: 1;
+        background: #262626;
+        color: #cfcfcf;
+        border: none;
+    }
+
+    .today-tab-button.today-tab-active {
+        background: #3d2d11;
+        color: #f5d28a;
+        text-style: bold;
+    }
+
+    #today-content-switcher {
+        height: 1fr;
+    }
+
+    .today-panel {
+        height: 1fr;
+        padding: 0 1 1 1;
+    }
+
+    #today-chat-entry {
+        height: auto;
+        margin-top: 1;
+    }
+
+    #today-chat-input {
+        width: 1fr;
+        margin-right: 1;
+    }
+
     #frame-gmail {
         border: round #32464f;
     }
@@ -2727,7 +2939,6 @@ class Workspace(App):
         ("a", "add_event", "Add"),
         ("c", "compose_email", "Compose"),
         ("d", "delete_email", "Delete"),
-        Binding("D", "reject_today_draft", "Reject", key_display="Shift+D"),
         ("e", "reply_email", "Reply"),
         Binding("E", "reply_all_email", "Reply All", key_display="Shift+E"),
         ("f", "forward_email", "Forward"),
@@ -2736,7 +2947,6 @@ class Workspace(App):
         ("o", "open_email_link", "Open Link"),
         ("p", "switch_profile", "Profile"),
         ("/", "search_email", "Search"),
-        Binding("A", "approve_today_draft", "Approve", key_display="Shift+A"),
         ("u", "toggle_unread_filter", "Unread"),
         ("x", "toggle_task_complete", "Toggle"),
         ("[", "previous_calendar_month", "Prev Mon"),
@@ -2859,13 +3069,6 @@ class Workspace(App):
             return self.current_module_id == "tasks"
         if action in {"previous_calendar_month", "next_calendar_month"}:
             return self.current_module_id == "calendar"
-        if action in {"approve_today_draft", "reject_today_draft"}:
-            if self.current_module_id != "today":
-                return False
-            today_view = self.module_views.get("today")
-            if not isinstance(today_view, TodayView):
-                return False
-            return True if today_view.current_draft_id() else None
         return True
 
     def _on_gws_event(self, event: GwsCommandEvent) -> None:
@@ -4010,6 +4213,91 @@ class Workspace(App):
         self.call_from_thread(self.module_views["sheets"].action_refresh)
         self.call_from_thread(self.module_views["drive"].action_refresh)
 
+    def _execute_workspace_action(self, action: GeminiChatAction) -> tuple[str, str]:
+        payload = action.payload or {}
+        if action.kind == "task_create":
+            tasks_module = next((module for module in self.modules if isinstance(module, TasksModule)), None)
+            if tasks_module is None:
+                raise ValueError("Tasks module unavailable")
+            if not tasks_module.default_create_tasklist_id():
+                tasks_module.tasklist_options(self.client)
+            tasklist_id = str(payload.get("tasklist_id", "") or tasks_module.default_create_tasklist_id()).strip()
+            if not tasklist_id:
+                raise ValueError("No writable task list available")
+            title = str(payload.get("title", "")).strip()
+            notes = str(payload.get("notes", "")).strip()
+            due_text = str(payload.get("due_text", "")).strip()
+            if not title:
+                raise ValueError("Task title is required")
+            tasks_module.create_task(
+                self.client,
+                tasklist_id=tasklist_id,
+                title=title,
+                notes=notes,
+                due_text=due_text,
+                profile_name=str(payload.get("profile_name", "") or self.current_profile_name or ""),
+            )
+            return "tasks", "Workspace action complete: task created"
+
+        if action.kind == "calendar_event_create":
+            calendar_module = next((module for module in self.modules if isinstance(module, CalendarModule)), None)
+            if calendar_module is None:
+                raise ValueError("Calendar module unavailable")
+            summary = str(payload.get("summary", "")).strip()
+            start_text = str(payload.get("start_text", "")).strip()
+            end_text = str(payload.get("end_text", "")).strip()
+            duration_text = str(payload.get("duration_text", "")).strip()
+            if not summary or not start_text:
+                raise ValueError("Calendar action requires summary and start time")
+            calendar_module.add_event(
+                self.client,
+                calendar_id=str(payload.get("calendar_id", "") or "primary").strip(),
+                summary=summary,
+                start_text=start_text,
+                end_text=end_text,
+                duration_text=duration_text,
+                location=str(payload.get("location", "")).strip(),
+                description=str(payload.get("description", "") or action.detail).strip(),
+                profile_name=str(payload.get("profile_name", "") or self.current_profile_name or ""),
+            )
+            return "calendar", "Workspace action complete: calendar event created"
+
+        if action.kind == "doc_create":
+            docs_module = next((module for module in self.modules if isinstance(module, DocsModule)), None)
+            if docs_module is None:
+                raise ValueError("Docs module unavailable")
+            title = str(payload.get("title", "")).strip()
+            if not title:
+                raise ValueError("Document title is required")
+            docs_module.create_document(
+                self.client,
+                title=title,
+                body=str(payload.get("body", "")).strip(),
+            )
+            return "docs", "Workspace action complete: document created"
+
+        if action.kind == "gmail_draft":
+            gmail_module = next((module for module in self.modules if isinstance(module, GmailModule)), None)
+            if gmail_module is None:
+                raise ValueError("Gmail module unavailable")
+            to = str(payload.get("to", "")).strip()
+            subject = str(payload.get("subject", "")).strip()
+            body = str(payload.get("body", "")).strip()
+            if not to or not subject or not body:
+                raise ValueError("Gmail draft requires to, subject, and body")
+            gmail_module.create_draft(
+                self.client,
+                to=to,
+                cc=str(payload.get("cc", "")).strip(),
+                subject=subject,
+                body=body,
+                attachment_paths=[],
+                body_format=str(payload.get("body_format", "plain")).strip() or "plain",
+            )
+            return "gmail", "Workspace action complete: Gmail draft saved"
+
+        raise ValueError(f"Unsupported workspace action: {action.kind}")
+
     @work(thread=True, exclusive=True)
     def _apply_today_draft(self, today_module: TodayModule, draft_id: str) -> None:
         draft = today_module.draft_by_id(draft_id)
@@ -4017,87 +4305,21 @@ class Workspace(App):
             self.call_from_thread(self.update_status, "Draft apply failed: draft no longer exists")
             return
         try:
+            title, notes, due_text = task_create_defaults(draft, today_module.current_context)
+            payload = dict(draft.payload)
             if draft.kind == "task_create":
-                tasks_module = next((module for module in self.modules if isinstance(module, TasksModule)), None)
-                if tasks_module is None:
-                    raise ValueError("Tasks module unavailable")
-                if not tasks_module.default_create_tasklist_id():
-                    tasks_module.tasklist_options(self.client)
-                tasklist_id = str(draft.payload.get("tasklist_id", "") or tasks_module.default_create_tasklist_id()).strip()
-                if not tasklist_id:
-                    raise ValueError("No writable task list available")
-                title, notes, due_text = task_create_defaults(draft, today_module.current_context)
-                if not title:
-                    raise ValueError("Task title is required")
-                tasks_module.create_task(
-                    self.client,
-                    tasklist_id=tasklist_id,
-                    title=title,
-                    notes=notes,
-                    due_text=due_text,
-                    profile_name=str(draft.payload.get("profile_name", "") or self.current_profile_name or ""),
+                payload["title"] = title
+                payload["notes"] = notes
+                payload["due_text"] = due_text
+            target_module_id, success_message = self._execute_workspace_action(
+                GeminiChatAction(
+                    kind=draft.kind,
+                    title=draft.title,
+                    detail=draft.detail,
+                    module_id=draft.module_id,
+                    payload=payload,
                 )
-                target_module_id = "tasks"
-                success_message = "Draft applied: task created"
-            elif draft.kind == "calendar_event_create":
-                calendar_module = next((module for module in self.modules if isinstance(module, CalendarModule)), None)
-                if calendar_module is None:
-                    raise ValueError("Calendar module unavailable")
-                summary = str(draft.payload.get("summary", "") or draft.title).strip()
-                start_text = str(draft.payload.get("start", "") or draft.payload.get("start_text", "")).strip()
-                end_text = str(draft.payload.get("end", "") or draft.payload.get("end_text", "")).strip()
-                duration_text = str(draft.payload.get("duration", "") or draft.payload.get("duration_text", "")).strip()
-                if not summary or not start_text:
-                    raise ValueError("Calendar draft requires summary and start time")
-                calendar_module.add_event(
-                    self.client,
-                    calendar_id=str(draft.payload.get("calendar_id", "") or "primary").strip(),
-                    summary=summary,
-                    start_text=start_text,
-                    end_text=end_text,
-                    duration_text=duration_text,
-                    location=str(draft.payload.get("location", "")).strip(),
-                    description=str(draft.payload.get("description", "") or draft.detail).strip(),
-                    profile_name=str(draft.payload.get("profile_name", "") or self.current_profile_name or ""),
-                )
-                target_module_id = "calendar"
-                success_message = "Draft applied: calendar event created"
-            elif draft.kind == "doc_create":
-                docs_module = next((module for module in self.modules if isinstance(module, DocsModule)), None)
-                if docs_module is None:
-                    raise ValueError("Docs module unavailable")
-                title = str(draft.payload.get("title", "") or draft.title).strip()
-                if not title:
-                    raise ValueError("Document title is required")
-                docs_module.create_document(
-                    self.client,
-                    title=title,
-                    body=str(draft.payload.get("body", "") or draft.detail).strip(),
-                )
-                target_module_id = "docs"
-                success_message = "Draft applied: document created"
-            elif draft.kind == "gmail_draft":
-                gmail_module = next((module for module in self.modules if isinstance(module, GmailModule)), None)
-                if gmail_module is None:
-                    raise ValueError("Gmail module unavailable")
-                to = str(draft.payload.get("to", "")).strip()
-                subject = str(draft.payload.get("subject", "") or draft.title).strip()
-                body = str(draft.payload.get("body", "") or draft.detail).strip()
-                if not to or not subject or not body:
-                    raise ValueError("Gmail draft requires to, subject, and body")
-                gmail_module.create_draft(
-                    self.client,
-                    to=to,
-                    cc=str(draft.payload.get("cc", "")).strip(),
-                    subject=subject,
-                    body=body,
-                    attachment_paths=[],
-                    body_format=str(draft.payload.get("body_format", "plain")).strip() or "plain",
-                )
-                target_module_id = "gmail"
-                success_message = "Draft applied: Gmail draft saved"
-            else:
-                raise ValueError(f"Unsupported draft type: {draft.kind}")
+            )
         except (FileNotFoundError, ValueError) as exc:
             self.call_from_thread(self.update_status, f"Draft apply failed: {exc}")
             return
@@ -4119,6 +4341,36 @@ class Workspace(App):
         if target_view is not None and getattr(target_view, "loaded", False):
             target_view.action_refresh()
         self.update_status(message)
+
+    @work(thread=True, exclusive=True)
+    def _execute_chat_action(self, action: GeminiChatAction) -> None:
+        try:
+            target_module_id, success_message = self._execute_workspace_action(action)
+        except (FileNotFoundError, ValueError) as exc:
+            self.call_from_thread(self._after_chat_action_failed, str(exc))
+            return
+        except GwsError as exc:
+            self.call_from_thread(self._after_chat_action_failed, exc.message)
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self._after_chat_action_failed, str(exc))
+            return
+        self.call_from_thread(self._after_chat_action_executed, target_module_id, success_message)
+
+    def _after_chat_action_executed(self, target_module_id: str, message: str) -> None:
+        today_view = self.module_views.get("today")
+        if isinstance(today_view, TodayView):
+            today_view.chat_action_finished(message)
+        target_view = self.module_views.get(target_module_id)
+        if target_view is not None and getattr(target_view, "loaded", False):
+            target_view.action_refresh()
+        self.update_status(message)
+
+    def _after_chat_action_failed(self, message: str) -> None:
+        today_view = self.module_views.get("today")
+        if isinstance(today_view, TodayView):
+            today_view.chat_action_failed(f"Workspace action failed: {message}")
+        self.update_status(f"Workspace action failed: {message}")
 
     @work(thread=True, exclusive=True)
     def _send_email(
