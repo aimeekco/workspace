@@ -30,7 +30,7 @@ from gws_tui.file_preview import (
     render_binary_preview,
     render_unavailable_preview,
 )
-from gws_tui.gemini_chat import GeminiChatAction, GeminiChatMessage, GeminiChatResponse, GeminiChatService
+from gws_tui.antigravity_chat import AntigravityChatAction, AntigravityChatMessage, AntigravityChatResponse, AntigravityChatService
 from gws_tui.models import Record
 from gws_tui.modules import WorkspaceModule, built_in_modules
 from gws_tui.modules.calendar import CalendarDetail, CalendarModule
@@ -64,7 +64,7 @@ PROFILE_DIAGNOSTICS_TTL_SECONDS = 30.0
 MAX_INLINE_FILE_BYTES = 4 * 1024 * 1024
 
 
-def format_chat_action_preview(action: GeminiChatAction) -> str:
+def format_chat_action_preview(action: AntigravityChatAction) -> str:
     payload = action.payload or {}
     if action.kind == "task_create":
         lines = [
@@ -1662,7 +1662,7 @@ class ModuleView(PassiveScrollableContainer):
 
 
 class TodayView(PassiveScrollableContainer):
-    """Gemini-powered workspace dashboard and chat."""
+    """Antigravity-powered workspace dashboard and chat."""
 
     module: TodayModule
 
@@ -1672,11 +1672,11 @@ class TodayView(PassiveScrollableContainer):
         self.client = client
         self.dashboard: TodayDashboard | None = None
         self.active_tab = "overview"
-        self.chat_service = GeminiChatService()
-        self.chat_history: list[GeminiChatMessage] = []
+        self.chat_service = AntigravityChatService()
+        self.chat_history: list[AntigravityChatMessage] = []
         self.chat_pending = False
         self.action_pending = False
-        self.proposed_action: GeminiChatAction | None = None
+        self.proposed_action: AntigravityChatAction | None = None
         self.loaded = False
 
     def compose(self) -> ComposeResult:
@@ -1686,7 +1686,7 @@ class TodayView(PassiveScrollableContainer):
         with Vertical(classes="module-body"):
             with Horizontal(id="today-tab-bar"):
                 yield Button("Overview", id="today-tab-overview", classes="today-tab-button")
-                yield Button("Gemini Chat", id="today-tab-chat", classes="today-tab-button")
+                yield Button("Antigravity Chat", id="today-tab-chat", classes="today-tab-button")
             with ContentSwitcher(initial="today-panel-overview", id="today-content-switcher"):
                 with Container(id="today-panel-overview", classes="today-panel"):
                     with FocusableScrollableContainer(id="today-overview-container", classes="detail-container"):
@@ -1695,7 +1695,7 @@ class TodayView(PassiveScrollableContainer):
                     with FocusableScrollableContainer(id="today-chat-transcript-container", classes="detail-container"):
                         yield Static("", id="today-chat-transcript")
                     with Horizontal(id="today-chat-entry"):
-                        yield Input(placeholder="Ask Gemini about your schedule, inbox, or priorities...", id="today-chat-input")
+                        yield Input(placeholder="Ask Antigravity about your schedule, inbox, or priorities...", id="today-chat-input")
                         yield Button("Approve Draft", id="today-chat-execute")
                         yield Button("Send", id="today-chat-send", variant="primary")
 
@@ -1796,20 +1796,20 @@ class TodayView(PassiveScrollableContainer):
         if not prompt:
             return
         history = list(self.chat_history)
-        self.chat_history.append(GeminiChatMessage(role="user", text=prompt))
+        self.chat_history.append(AntigravityChatMessage(role="user", text=prompt))
         self.chat_pending = True
         self.proposed_action = None
         input_widget.value = ""
         self._set_active_tab("chat")
         self._render_chat_transcript()
         self._refresh_chat_buttons()
-        self.app.update_status("Gemini: generating reply...")
+        self.app.update_status("Antigravity: generating reply...")
         self._send_chat_message(history, prompt, self.module.current_context, self.module.current_brief)
 
     @work(thread=True, exclusive=True)
     def _send_chat_message(
         self,
-        history: list[GeminiChatMessage],
+        history: list[AntigravityChatMessage],
         prompt: str,
         context,
         brief,
@@ -1821,27 +1821,27 @@ class TodayView(PassiveScrollableContainer):
             return
         self.app.call_from_thread(self._complete_chat, response)
 
-    def _complete_chat(self, response: GeminiChatResponse) -> None:
+    def _complete_chat(self, response: AntigravityChatResponse) -> None:
         self.chat_pending = False
         self.proposed_action = response.action
-        self.chat_history.append(GeminiChatMessage(role="assistant", text=response.reply, sources=response.sources))
+        self.chat_history.append(AntigravityChatMessage(role="assistant", text=response.reply, sources=response.sources))
         self._render_chat_transcript()
         self._refresh_chat_buttons()
-        self.app.update_status("Gemini: reply ready")
+        self.app.update_status("Antigravity: reply ready")
 
     def _handle_chat_error(self, message: str) -> None:
         self.chat_pending = False
         self.proposed_action = None
-        self.chat_history.append(GeminiChatMessage(role="assistant", text=f"Gemini error: {message}"))
+        self.chat_history.append(AntigravityChatMessage(role="assistant", text=f"Antigravity error: {message}"))
         self._render_chat_transcript()
         self._refresh_chat_buttons()
-        self.app.update_status("Gemini: request failed")
+        self.app.update_status("Antigravity: request failed")
 
     @work(thread=True, exclusive=True)
     def _revise_after_action_error(
         self,
-        history: list[GeminiChatMessage],
-        failed_action: GeminiChatAction,
+        history: list[AntigravityChatMessage],
+        failed_action: AntigravityChatAction,
         error_message: str,
         context,
         brief,
@@ -1856,15 +1856,15 @@ class TodayView(PassiveScrollableContainer):
     def _render_chat_transcript(self) -> None:
         if not self.chat_history and not self.chat_pending:
             text = (
-                "Ask Gemini about today’s priorities, meetings, unread mail, or follow-ups.\n\n"
-                "Gemini can search the web for current external information and will show sources when it does.\n\n"
+                "Ask Antigravity about today’s priorities, meetings, unread mail, or follow-ups.\n\n"
+                "Antigravity can search the web for current external information and will show sources when it does.\n\n"
                 "You can also ask it to create a task, schedule an event, draft an email, or create a doc. "
                 "When it has enough detail, it will prepare a draft preview that you can approve."
             )
         else:
             lines: list[str] = []
             for message in self.chat_history:
-                speaker = "You" if message.role == "user" else "Gemini"
+                speaker = "You" if message.role == "user" else "Antigravity"
                 lines.append(f"{speaker}:")
                 lines.append(message.text)
                 if message.sources:
@@ -1875,7 +1875,7 @@ class TodayView(PassiveScrollableContainer):
                         lines.append(source.url)
                 lines.append("")
             if self.chat_pending:
-                lines.append("Gemini:")
+                lines.append("Antigravity:")
                 lines.append("Thinking...")
             elif self.action_pending and self.proposed_action is not None:
                 lines.append("Approving draft:")
@@ -1889,7 +1889,7 @@ class TodayView(PassiveScrollableContainer):
                 lines.append(format_chat_action_preview(self.proposed_action))
             text = "\n".join(lines).strip()
         self.query_one("#today-chat-transcript", Static).update(
-            Panel(Text(text), title="Gemini Chat", subtitle="Workspace-aware", border_style=MODULE_ACCENTS["today"], box=box.ROUNDED)
+            Panel(Text(text), title="Antigravity Chat", subtitle="Workspace-aware", border_style=MODULE_ACCENTS["today"], box=box.ROUNDED)
         )
         self.call_after_refresh(self._scroll_chat_to_bottom)
 
@@ -1906,7 +1906,7 @@ class TodayView(PassiveScrollableContainer):
         else:
             execute_button.label = "Approve Draft"
 
-    def _action_label(self, action: GeminiChatAction) -> str:
+    def _action_label(self, action: AntigravityChatAction) -> str:
         labels = {
             "task_create": "Create task",
             "calendar_event_create": "Create event",
@@ -1918,7 +1918,7 @@ class TodayView(PassiveScrollableContainer):
     def chat_action_finished(self, message: str) -> None:
         self.action_pending = False
         self.proposed_action = None
-        self.chat_history.append(GeminiChatMessage(role="assistant", text=f"{message}\n\nDraft approved."))
+        self.chat_history.append(AntigravityChatMessage(role="assistant", text=f"{message}\n\nDraft approved."))
         self._render_chat_transcript()
         self._refresh_chat_buttons()
 
@@ -1926,13 +1926,13 @@ class TodayView(PassiveScrollableContainer):
         failed_action = self.proposed_action
         self.action_pending = False
         self.proposed_action = None
-        self.chat_history.append(GeminiChatMessage(role="assistant", text=f"{message}\n\nRevising draft..."))
+        self.chat_history.append(AntigravityChatMessage(role="assistant", text=f"{message}\n\nRevising draft..."))
         self.chat_pending = failed_action is not None
         self._render_chat_transcript()
         self._refresh_chat_buttons()
         if failed_action is None:
             return
-        self.app.update_status("Gemini: revising draft...")
+        self.app.update_status("Antigravity: revising draft...")
         self._revise_after_action_error(
             list(self.chat_history),
             failed_action,
@@ -4214,7 +4214,7 @@ class Workspace(App):
         self.call_from_thread(self.module_views["sheets"].action_refresh)
         self.call_from_thread(self.module_views["drive"].action_refresh)
 
-    def _execute_workspace_action(self, action: GeminiChatAction) -> tuple[str, str]:
+    def _execute_workspace_action(self, action: AntigravityChatAction) -> tuple[str, str]:
         payload = action.payload or {}
         if action.kind == "task_create":
             tasks_module = next((module for module in self.modules if isinstance(module, TasksModule)), None)
@@ -4313,7 +4313,7 @@ class Workspace(App):
                 payload["notes"] = notes
                 payload["due_text"] = due_text
             target_module_id, success_message = self._execute_workspace_action(
-                GeminiChatAction(
+                AntigravityChatAction(
                     kind=draft.kind,
                     title=draft.title,
                     detail=draft.detail,
@@ -4344,7 +4344,7 @@ class Workspace(App):
         self.update_status(message)
 
     @work(thread=True, exclusive=True)
-    def _execute_chat_action(self, action: GeminiChatAction) -> None:
+    def _execute_chat_action(self, action: AntigravityChatAction) -> None:
         try:
             target_module_id, success_message = self._execute_workspace_action(action)
         except (FileNotFoundError, ValueError) as exc:

@@ -32,7 +32,7 @@ class SearchResult:
 
 
 class WebSearchService:
-    """Provider-backed web search service for Gemini tool calls."""
+    """Provider-backed web search service for Antigravity tool calls."""
 
     def __init__(
         self,

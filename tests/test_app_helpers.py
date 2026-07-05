@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from gws_tui.app import Workspace, format_chat_action_preview
-from gws_tui.gemini_chat import GeminiChatAction
+from gws_tui.antigravity_chat import AntigravityChatAction
 
 
 class ChatActionPreviewTest(unittest.TestCase):
@@ -14,7 +14,7 @@ class ChatActionPreviewTest(unittest.TestCase):
 
     def test_calendar_preview_shows_summary_start_and_duration(self) -> None:
         preview = format_chat_action_preview(
-            GeminiChatAction(
+            AntigravityChatAction(
                 kind="calendar_event_create",
                 title="Project Sync",
                 payload={
@@ -37,7 +37,7 @@ class ChatActionPreviewTest(unittest.TestCase):
 
     def test_task_preview_shows_title_due_and_notes(self) -> None:
         preview = format_chat_action_preview(
-            GeminiChatAction(
+            AntigravityChatAction(
                 kind="task_create",
                 title="Follow up",
                 payload={
@@ -55,7 +55,7 @@ class ChatActionPreviewTest(unittest.TestCase):
 
     def test_email_preview_shows_recipients_subject_and_body(self) -> None:
         preview = format_chat_action_preview(
-            GeminiChatAction(
+            AntigravityChatAction(
                 kind="gmail_draft",
                 title="Status update",
                 payload={

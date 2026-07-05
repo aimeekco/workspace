@@ -82,39 +82,45 @@ class TasksModule(WorkspaceModule):
             options = [{"id": "", "name": "All Tasks"}]
             for profile in target_profiles:
                 profile_client = self._client_for_profile(client, profile.name)
-                response = profile_client.run(
-                    "tasks",
-                    "tasklists",
-                    "list",
-                    params={"maxResults": 100},
-                    page_all=True,
-                )
-                tasklists = self._collect_items(response, "items")
-                for tasklist in tasklists:
-                    tasklist_id = tasklist.get("id", "")
-                    tasklist_name = tasklist.get("title", "Untitled list")
-                    if not tasklist_id or not tasklist_name:
-                        continue
-                    options.append(
-                        {
-                            "id": self._tasklist_key(profile.name, tasklist_id),
-                            "name": self._display_tasklist_name(tasklist_name, profile.name, True),
-                            "profile_name": profile.name,
-                            "tasklist_id": tasklist_id,
-                            "tasklist_name": tasklist_name,
-                        }
+                try:
+                    response = profile_client.run(
+                        "tasks",
+                        "tasklists",
+                        "list",
+                        params={"maxResults": 100},
+                        page_all=True,
                     )
+                    tasklists = self._collect_items(response, "items")
+                    for tasklist in tasklists:
+                        tasklist_id = tasklist.get("id", "")
+                        tasklist_name = tasklist.get("title", "Untitled list")
+                        if not tasklist_id or not tasklist_name:
+                            continue
+                        options.append(
+                            {
+                                "id": self._tasklist_key(profile.name, tasklist_id),
+                                "name": self._display_tasklist_name(tasklist_name, profile.name, True),
+                                "profile_name": profile.name,
+                                "tasklist_id": tasklist_id,
+                                "tasklist_name": tasklist_name,
+                            }
+                        )
+                except Exception:
+                    continue
             self.tasklists = options
             self._sync_selected_tasklist()
             return self.tasklists
-        response = client.run(
-            "tasks",
-            "tasklists",
-            "list",
-            params={"maxResults": 100},
-            page_all=True,
-        )
-        tasklists = self._collect_items(response, "items")
+        try:
+            response = client.run(
+                "tasks",
+                "tasklists",
+                "list",
+                params={"maxResults": 100},
+                page_all=True,
+            )
+            tasklists = self._collect_items(response, "items")
+        except Exception:
+            tasklists = []
         options = [{"id": "", "name": "All Tasks"}]
         for tasklist in tasklists:
             options.append(
@@ -348,21 +354,24 @@ class TasksModule(WorkspaceModule):
     def _fetch_tasklist_tasks(self, client: GwsClient, tasklist: dict[str, Any]) -> list[dict[str, Any]]:
         profile_name = str(tasklist.get("profile_name", "") or "")
         target_client = self._client_for_profile(client, profile_name)
-        response = target_client.run(
-            "tasks",
-            "tasks",
-            "list",
-            params={
-                "tasklist": tasklist.get("id", ""),
-                "maxResults": 100,
-                "showCompleted": True,
-                "showHidden": False,
-                "showDeleted": False,
-                "showAssigned": True,
-            },
-            page_all=True,
-        )
-        return self._collect_items(response, "items")
+        try:
+            response = target_client.run(
+                "tasks",
+                "tasks",
+                "list",
+                params={
+                    "tasklist": tasklist.get("id", ""),
+                    "maxResults": 100,
+                    "showCompleted": True,
+                    "showHidden": False,
+                    "showDeleted": False,
+                    "showAssigned": True,
+                },
+                page_all=True,
+            )
+            return self._collect_items(response, "items")
+        except Exception:
+            return []
 
     def _collect_items(self, response: dict[str, Any] | list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
         if isinstance(response, list):

@@ -22,7 +22,7 @@ from gws_tui.profiles import GwsProfile
 
 CACHE_SCHEMA_VERSION = 1
 DEFAULT_CACHE_FILE = ".gws_tui_today_cache.json"
-DEFAULT_GEMINI_TIMEOUT_SECONDS = 60.0
+DEFAULT_ANTIGRAVITY_TIMEOUT_SECONDS = 60.0
 GENERIC_TASK_DRAFT_PREFIXES = ("draft ", "create ", "add ", "reminder ", "follow up")
 
 
@@ -156,7 +156,7 @@ class TodayBrief:
                 if (draft := DraftAction.from_raw(index, item)) is not None
             ],
             warnings=[str(item).strip() for item in payload.get("warnings", []) if str(item).strip()],
-            source=str(payload.get("source", "gemini") or "gemini").strip(),
+            source=str(payload.get("source", "antigravity") or "antigravity").strip(),
         )
 
 
@@ -181,17 +181,19 @@ def _tail_snippet(value: str, limit: int = 240) -> str:
 
 def _env_timeout_seconds() -> float:
     raw = (
-        os.environ.get("GWS_TUI_GEMINI_TIMEOUT_SECONDS", "").strip()
+        os.environ.get("GWS_TUI_ANTIGRAVITY_TIMEOUT_SECONDS", "").strip()
+        or os.environ.get("ANTIGRAVITY_TIMEOUT_SECONDS", "").strip()
+        or os.environ.get("GWS_TUI_GEMINI_TIMEOUT_SECONDS", "").strip()
         or os.environ.get("GEMINI_TIMEOUT_SECONDS", "").strip()
     )
     if not raw:
-        return DEFAULT_GEMINI_TIMEOUT_SECONDS
+        return DEFAULT_ANTIGRAVITY_TIMEOUT_SECONDS
     try:
         value = float(raw)
     except ValueError:
-        return DEFAULT_GEMINI_TIMEOUT_SECONDS
+        return DEFAULT_ANTIGRAVITY_TIMEOUT_SECONDS
     if value <= 0:
-        return DEFAULT_GEMINI_TIMEOUT_SECONDS
+        return DEFAULT_ANTIGRAVITY_TIMEOUT_SECONDS
     return value
 
 
@@ -465,40 +467,40 @@ class TodayCache:
 
 
 class TodayPlanner:
-    """Generate a Today brief using Gemini with a deterministic fallback."""
+    """Generate a Today brief using Antigravity with a deterministic fallback."""
 
     def __init__(
         self,
-        gemini_api_key: str | None = None,
-        gemini_model: str | None = None,
+        antigravity_api_key: str | None = None,
+        antigravity_model: str | None = None,
         timeout_seconds: float | None = None,
     ) -> None:
-        self.gemini_api_key = (
-            gemini_api_key
-            or os.environ.get("GWS_TUI_GEMINI_API_KEY", "").strip()
-            or os.environ.get("GEMINI_API_KEY", "").strip()
+        self.antigravity_api_key = (
+            antigravity_api_key
+            or os.environ.get("GWS_TUI_ANTIGRAVITY_API_KEY", "").strip()
+            or os.environ.get("ANTIGRAVITY_API_KEY", "").strip()
         )
-        self.gemini_model = (
-            gemini_model
-            or os.environ.get("GWS_TUI_GEMINI_MODEL", "").strip()
-            or os.environ.get("GEMINI_MODEL", "").strip()
+        self.antigravity_model = (
+            antigravity_model
+            or os.environ.get("GWS_TUI_ANTIGRAVITY_MODEL", "").strip()
+            or os.environ.get("ANTIGRAVITY_MODEL", "").strip()
         )
         self.timeout_seconds = timeout_seconds or _env_timeout_seconds()
 
     def generate(self, context: WorkspaceContext) -> TodayBrief:
-        if not self.gemini_api_key:
+        if not self.antigravity_api_key:
             brief = self.fallback(context)
-            brief.warnings.append("Gemini disabled: set GWS_TUI_GEMINI_API_KEY or GEMINI_API_KEY to enable AI planning.")
+            brief.warnings.append("Antigravity disabled: set GWS_TUI_ANTIGRAVITY_API_KEY or ANTIGRAVITY_API_KEY to enable AI planning.")
             return brief
 
         try:
-            payload = self._call_gemini(context)
+            payload = self._call_antigravity(context)
             brief = TodayBrief.from_dict(payload)
-            brief.source = "gemini"
+            brief.source = "antigravity"
             return brief
         except Exception as exc:  # noqa: BLE001
             brief = self.fallback(context)
-            brief.warnings.append(f"Gemini fallback: {exc}")
+            brief.warnings.append(f"Antigravity fallback: {exc}")
             return brief
 
     def fallback(self, context: WorkspaceContext) -> TodayBrief:
@@ -555,7 +557,7 @@ class TodayPlanner:
             source="heuristic",
         )
 
-    def _call_gemini(self, context: WorkspaceContext) -> dict[str, Any]:
+    def _call_antigravity(self, context: WorkspaceContext) -> dict[str, Any]:
         prompt = self._prompt(context)
         body = {
             "contents": [{"parts": [{"text": prompt}]}],
@@ -564,8 +566,8 @@ class TodayPlanner:
                 "responseMimeType": "application/json",
             },
         }
-        encoded_model = parse.quote(self.gemini_model, safe="")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{encoded_model}:generateContent?key={self.gemini_api_key}"
+        encoded_model = parse.quote(self.antigravity_model, safe="")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{encoded_model}:generateContent?key={self.antigravity_api_key}"
         http_request = request.Request(
             url,
             data=json.dumps(body).encode("utf-8"),
@@ -589,10 +591,10 @@ class TodayPlanner:
             .get("text", "")
         )
         if not text:
-            raise RuntimeError("Gemini returned no content.")
+            raise RuntimeError("Antigravity returned no content.")
         parsed = json.loads(text)
         if not isinstance(parsed, dict):
-            raise RuntimeError("Gemini returned a non-object payload.")
+            raise RuntimeError("Antigravity returned a non-object payload.")
         return parsed
 
     def _prompt(self, context: WorkspaceContext) -> str:

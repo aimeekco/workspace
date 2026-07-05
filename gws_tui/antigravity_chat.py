@@ -13,22 +13,22 @@ if TYPE_CHECKING:
 from gws_tui.web_search import DEFAULT_WEB_SEARCH_LIMIT, SearchResult, WebSearchService
 
 
-DEFAULT_GEMINI_CHAT_MODEL = "gemini-2.0-flash"
-DEFAULT_GEMINI_TIMEOUT_SECONDS = 60.0
+DEFAULT_ANTIGRAVITY_CHAT_MODEL = "gemini-2.0-flash"
+DEFAULT_ANTIGRAVITY_TIMEOUT_SECONDS = 60.0
 MAX_CONTEXT_RECORDS = 40
 ALLOWED_ACTION_KINDS = {"task_create", "calendar_event_create", "doc_create", "gmail_draft"}
 ALLOWED_TOOL_NAMES = {"web_search"}
 
 
 @dataclass(slots=True)
-class GeminiChatMessage:
+class AntigravityChatMessage:
     role: str
     text: str
-    sources: list["GeminiChatSource"] = field(default_factory=list)
+    sources: list["AntigravityChatSource"] = field(default_factory=list)
 
 
 @dataclass(slots=True)
-class GeminiChatAction:
+class AntigravityChatAction:
     kind: str
     title: str
     detail: str = ""
@@ -37,104 +37,104 @@ class GeminiChatAction:
 
 
 @dataclass(slots=True)
-class GeminiChatResponse:
+class AntigravityChatResponse:
     reply: str
-    action: GeminiChatAction | None = None
-    sources: list["GeminiChatSource"] = field(default_factory=list)
+    action: AntigravityChatAction | None = None
+    sources: list["AntigravityChatSource"] = field(default_factory=list)
 
 
 @dataclass(slots=True)
-class GeminiChatSource:
+class AntigravityChatSource:
     title: str
     url: str
     snippet: str = ""
 
 
 @dataclass(slots=True)
-class GeminiToolRequest:
+class AntigravityToolRequest:
     name: str
     query: str
     limit: int = DEFAULT_WEB_SEARCH_LIMIT
 
 
 @dataclass(slots=True)
-class ParsedGeminiResponse:
+class ParsedAntigravityResponse:
     reply: str
-    action: GeminiChatAction | None = None
-    sources: list[GeminiChatSource] = field(default_factory=list)
-    tool_request: GeminiToolRequest | None = None
+    action: AntigravityChatAction | None = None
+    sources: list[AntigravityChatSource] = field(default_factory=list)
+    tool_request: AntigravityToolRequest | None = None
 
 
-class GeminiChatService:
-    """Gemini chat client with workspace actions and web search tool calls."""
+class AntigravityChatService:
+    """Antigravity chat client with workspace actions and web search tool calls."""
 
     def __init__(
         self,
-        gemini_api_key: str | None = None,
-        gemini_model: str | None = None,
+        antigravity_api_key: str | None = None,
+        antigravity_model: str | None = None,
         timeout_seconds: float | None = None,
         web_search_service: WebSearchService | None = None,
     ) -> None:
-        self.gemini_api_key = (
-            gemini_api_key
-            or os.environ.get("GWS_TUI_GEMINI_API_KEY", "").strip()
-            or os.environ.get("GEMINI_API_KEY", "").strip()
+        self.antigravity_api_key = (
+            antigravity_api_key
+            or os.environ.get("GWS_TUI_ANTIGRAVITY_API_KEY", "").strip()
+            or os.environ.get("ANTIGRAVITY_API_KEY", "").strip()
         )
-        self.gemini_model = (
-            gemini_model
-            or os.environ.get("GWS_TUI_GEMINI_MODEL", "").strip()
-            or os.environ.get("GEMINI_MODEL", "").strip()
-            or DEFAULT_GEMINI_CHAT_MODEL
+        self.antigravity_model = (
+            antigravity_model
+            or os.environ.get("GWS_TUI_ANTIGRAVITY_MODEL", "").strip()
+            or os.environ.get("ANTIGRAVITY_MODEL", "").strip()
+            or DEFAULT_ANTIGRAVITY_CHAT_MODEL
         )
         self.timeout_seconds = timeout_seconds or _env_timeout_seconds()
         self.web_search_service = web_search_service or WebSearchService()
 
     def respond(
         self,
-        history: list[GeminiChatMessage],
+        history: list[AntigravityChatMessage],
         prompt: str,
         context: WorkspaceContext | None,
         brief: TodayBrief | None,
-    ) -> GeminiChatResponse:
-        if not self.gemini_api_key:
-            raise RuntimeError("Gemini disabled: set GWS_TUI_GEMINI_API_KEY or GEMINI_API_KEY to enable chat.")
+    ) -> AntigravityChatResponse:
+        if not self.antigravity_api_key:
+            raise RuntimeError("Antigravity disabled: set GWS_TUI_ANTIGRAVITY_API_KEY or ANTIGRAVITY_API_KEY to enable chat.")
 
         prompt_text = self._prompt(history, prompt, context, brief)
-        text = self._call_gemini(prompt_text)
+        text = self._call_antigravity(prompt_text)
         if not text:
-            raise RuntimeError("Gemini returned no content.")
+            raise RuntimeError("Antigravity returned no content.")
         parsed = self._parse_response(text)
         if parsed.tool_request is None:
-            return GeminiChatResponse(reply=parsed.reply, action=parsed.action, sources=parsed.sources)
+            return AntigravityChatResponse(reply=parsed.reply, action=parsed.action, sources=parsed.sources)
 
         search_results = self.web_search_service.search(parsed.tool_request.query, parsed.tool_request.limit)
         if not search_results:
             raise RuntimeError("Web search returned no results.")
         follow_up_prompt = self._search_follow_up_prompt(history, prompt, context, brief, parsed.tool_request, search_results)
-        follow_up_text = self._call_gemini(follow_up_prompt)
+        follow_up_text = self._call_antigravity(follow_up_prompt)
         if not follow_up_text:
-            raise RuntimeError("Gemini returned no content after web search.")
+            raise RuntimeError("Antigravity returned no content after web search.")
         final_response = self._parse_response(follow_up_text, available_sources=search_results)
-        return GeminiChatResponse(reply=final_response.reply, action=final_response.action, sources=final_response.sources)
+        return AntigravityChatResponse(reply=final_response.reply, action=final_response.action, sources=final_response.sources)
 
     def revise_after_action_error(
         self,
-        history: list[GeminiChatMessage],
-        failed_action: GeminiChatAction,
+        history: list[AntigravityChatMessage],
+        failed_action: AntigravityChatAction,
         error_message: str,
         context: WorkspaceContext | None,
         brief: TodayBrief | None,
-    ) -> GeminiChatResponse:
-        if not self.gemini_api_key:
-            raise RuntimeError("Gemini disabled: set GWS_TUI_GEMINI_API_KEY or GEMINI_API_KEY to enable chat.")
+    ) -> AntigravityChatResponse:
+        if not self.antigravity_api_key:
+            raise RuntimeError("Antigravity disabled: set GWS_TUI_ANTIGRAVITY_API_KEY or ANTIGRAVITY_API_KEY to enable chat.")
         prompt_text = self._revision_prompt(history, failed_action, error_message, context, brief)
-        text = self._call_gemini(prompt_text)
+        text = self._call_antigravity(prompt_text)
         if not text:
-            raise RuntimeError("Gemini returned no content while revising the draft.")
+            raise RuntimeError("Antigravity returned no content while revising the draft.")
         parsed = self._parse_response(text)
-        return GeminiChatResponse(reply=parsed.reply, action=parsed.action, sources=parsed.sources)
+        return AntigravityChatResponse(reply=parsed.reply, action=parsed.action, sources=parsed.sources)
 
-    def _call_gemini(self, prompt_text: str) -> str:
+    def _call_antigravity(self, prompt_text: str) -> str:
         body = {
             "contents": [{"parts": [{"text": prompt_text}]}],
             "generationConfig": {
@@ -142,8 +142,8 @@ class GeminiChatService:
                 "responseMimeType": "application/json",
             },
         }
-        encoded_model = parse.quote(self.gemini_model, safe="")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{encoded_model}:generateContent?key={self.gemini_api_key}"
+        encoded_model = parse.quote(self.antigravity_model, safe="")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{encoded_model}:generateContent?key={self.antigravity_api_key}"
         http_request = request.Request(
             url,
             data=json.dumps(body).encode("utf-8"),
@@ -164,7 +164,7 @@ class GeminiChatService:
 
     def _prompt(
         self,
-        history: list[GeminiChatMessage],
+        history: list[AntigravityChatMessage],
         prompt: str,
         context: WorkspaceContext | None,
         brief: TodayBrief | None,
@@ -200,14 +200,6 @@ class GeminiChatService:
                         "payload": {"any": "json"},
                     },
                 },
-                "tool_request": {
-                    "type": "object or null",
-                    "shape": {
-                        "name": "web_search",
-                        "query": "string",
-                        "limit": "integer 1-5",
-                    },
-                },
                 "source_urls": ["string"],
             },
             "available_tools": [
@@ -230,11 +222,11 @@ class GeminiChatService:
 
     def _search_follow_up_prompt(
         self,
-        history: list[GeminiChatMessage],
+        history: list[AntigravityChatMessage],
         prompt: str,
         context: WorkspaceContext | None,
         brief: TodayBrief | None,
-        tool_request: GeminiToolRequest,
+        tool_request: AntigravityToolRequest,
         search_results: list[SearchResult],
     ) -> str:
         payload = {
@@ -288,8 +280,8 @@ class GeminiChatService:
 
     def _revision_prompt(
         self,
-        history: list[GeminiChatMessage],
-        failed_action: GeminiChatAction,
+        history: list[AntigravityChatMessage],
+        failed_action: AntigravityChatAction,
         error_message: str,
         context: WorkspaceContext | None,
         brief: TodayBrief | None,
@@ -356,20 +348,20 @@ class GeminiChatService:
         texts = [str(part.get("text", "") or "").strip() for part in parts if isinstance(part, dict)]
         return "\n\n".join(text for text in texts if text).strip()
 
-    def _parse_response(self, text: str, available_sources: list[SearchResult] | None = None) -> ParsedGeminiResponse:
+    def _parse_response(self, text: str, available_sources: list[SearchResult] | None = None) -> ParsedAntigravityResponse:
         try:
             payload = json.loads(text)
         except json.JSONDecodeError:
-            return ParsedGeminiResponse(reply=text)
+            return ParsedAntigravityResponse(reply=text)
         if not isinstance(payload, dict):
-            return ParsedGeminiResponse(reply=text)
+            return ParsedAntigravityResponse(reply=text)
         reply = str(payload.get("reply", "") or "").strip() or "Done."
         action = self._parse_action(payload.get("action"))
         tool_request = self._parse_tool_request(payload.get("tool_request"))
         sources = self._parse_sources(payload.get("source_urls"), available_sources)
-        return ParsedGeminiResponse(reply=reply, action=action, sources=sources, tool_request=tool_request)
+        return ParsedAntigravityResponse(reply=reply, action=action, sources=sources, tool_request=tool_request)
 
-    def _parse_tool_request(self, value: Any) -> GeminiToolRequest | None:
+    def _parse_tool_request(self, value: Any) -> AntigravityToolRequest | None:
         if not isinstance(value, dict):
             return None
         name = str(value.get("name", "") or "").strip()
@@ -381,13 +373,13 @@ class GeminiChatService:
         except (TypeError, ValueError):
             limit = DEFAULT_WEB_SEARCH_LIMIT
         bounded_limit = max(1, min(limit, 5))
-        return GeminiToolRequest(name=name, query=query, limit=bounded_limit)
+        return AntigravityToolRequest(name=name, query=query, limit=bounded_limit)
 
-    def _parse_sources(self, value: Any, available_sources: list[SearchResult] | None) -> list[GeminiChatSource]:
+    def _parse_sources(self, value: Any, available_sources: list[SearchResult] | None) -> list[AntigravityChatSource]:
         if not isinstance(value, list):
             return []
         source_map = {source.url: source for source in (available_sources or [])}
-        sources: list[GeminiChatSource] = []
+        sources: list[AntigravityChatSource] = []
         seen_urls: set[str] = set()
         for item in value:
             url = str(item or "").strip()
@@ -395,13 +387,13 @@ class GeminiChatService:
                 continue
             matched = source_map.get(url)
             if matched is not None:
-                sources.append(GeminiChatSource(title=matched.title, url=matched.url, snippet=matched.snippet))
+                sources.append(AntigravityChatSource(title=matched.title, url=matched.url, snippet=matched.snippet))
             else:
-                sources.append(GeminiChatSource(title=url, url=url))
+                sources.append(AntigravityChatSource(title=url, url=url))
             seen_urls.add(url)
         return sources
 
-    def _parse_action(self, value: Any) -> GeminiChatAction | None:
+    def _parse_action(self, value: Any) -> AntigravityChatAction | None:
         if not isinstance(value, dict):
             return None
         kind = str(value.get("kind", "") or "").strip()
@@ -415,7 +407,7 @@ class GeminiChatService:
         if normalized_payload is None:
             return None
         normalized_title = str(normalized_payload.get("title", "") or normalized_payload.get("summary", "") or title).strip()
-        return GeminiChatAction(
+        return AntigravityChatAction(
             kind=kind,
             title=normalized_title or title,
             detail=str(value.get("detail", "") or "").strip(),
@@ -532,17 +524,19 @@ def serialize_workspace_context(context: WorkspaceContext | None) -> dict[str, A
 
 def _env_timeout_seconds() -> float:
     raw = (
-        os.environ.get("GWS_TUI_GEMINI_TIMEOUT_SECONDS", "").strip()
+        os.environ.get("GWS_TUI_ANTIGRAVITY_TIMEOUT_SECONDS", "").strip()
+        or os.environ.get("ANTIGRAVITY_TIMEOUT_SECONDS", "").strip()
+        or os.environ.get("GWS_TUI_GEMINI_TIMEOUT_SECONDS", "").strip()
         or os.environ.get("GEMINI_TIMEOUT_SECONDS", "").strip()
     )
     if not raw:
-        return DEFAULT_GEMINI_TIMEOUT_SECONDS
+        return DEFAULT_ANTIGRAVITY_TIMEOUT_SECONDS
     try:
         value = float(raw)
     except ValueError:
-        return DEFAULT_GEMINI_TIMEOUT_SECONDS
+        return DEFAULT_ANTIGRAVITY_TIMEOUT_SECONDS
     if value <= 0:
-        return DEFAULT_GEMINI_TIMEOUT_SECONDS
+        return DEFAULT_ANTIGRAVITY_TIMEOUT_SECONDS
     return value
 
 

@@ -41,7 +41,7 @@ class FakePlanner:
 
 class TodayPlannerTest(unittest.TestCase):
     def test_fallback_prioritizes_tasks_and_unread_mail(self) -> None:
-        planner = TodayPlanner(gemini_api_key="")
+        planner = TodayPlanner(antigravity_api_key="")
         context = WorkspaceContext(
             profile_name="default",
             day_iso="2026-03-09",
@@ -87,8 +87,8 @@ class TodayPlannerTest(unittest.TestCase):
         self.assertIn("open tasks", brief.summary)
 
     def test_timeout_uses_env_override(self) -> None:
-        with patch.dict(os.environ, {"GEMINI_TIMEOUT_SECONDS": "90"}, clear=False):
-            planner = TodayPlanner(gemini_api_key="key")
+        with patch.dict(os.environ, {"ANTIGRAVITY_TIMEOUT_SECONDS": "90"}, clear=False):
+            planner = TodayPlanner(antigravity_api_key="key")
 
         self.assertEqual(planner.timeout_seconds, 90.0)
 
@@ -142,7 +142,7 @@ class TodayCacheTest(unittest.TestCase):
     def test_cache_round_trips_brief(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             cache = TodayCache(Path(tmp_dir) / ".today-cache.json")
-            brief = TodayBrief(summary="Cached summary", warnings=["cached"], source="gemini")
+            brief = TodayBrief(summary="Cached summary", warnings=["cached"], source="antigravity")
 
             cache.save("work", "2026-03-09", brief)
             loaded = cache.load("work", "2026-03-09")
@@ -169,7 +169,7 @@ class TodayModuleTest(unittest.TestCase):
                     )
                 ],
             )
-            brief = TodayBrief(summary="Plan", source="gemini")
+            brief = TodayBrief(summary="Plan", source="antigravity")
             aggregator = FakeAggregator(context)
             planner = FakePlanner(brief)
             cache = TodayCache(Path(tmp_dir) / ".today-cache.json")
@@ -191,7 +191,7 @@ class TodayModuleTest(unittest.TestCase):
             context = WorkspaceContext(profile_name="default", day_iso="2026-03-09", records=[])
             brief = TodayBrief(
                 summary="Focus on the launch checklist first.",
-                source="gemini",
+                source="antigravity",
                 warnings=["Mailbox data is partial."],
             )
             module = TodayModule(
@@ -211,7 +211,7 @@ class TodayModuleTest(unittest.TestCase):
             context = WorkspaceContext(profile_name="default", day_iso="2026-03-09", records=[])
             brief = TodayBrief(
                 summary="Plan",
-                source="gemini",
+                source="antigravity",
                 drafts=[
                     DraftAction(
                         id="draft-1",

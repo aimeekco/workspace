@@ -67,7 +67,7 @@ Keep this order aligned with:
 ## Module Notes
 
 ### Today
-- New workspace-wide daily briefing powered by Gemini or a heuristic fallback
+- New workspace-wide daily briefing powered by Antigravity or a heuristic fallback
 - Focuses on unread Gmail, today's calendar, open tasks, and recent files/docs/sheets
 - Maintains a Today-pane draft queue for approval-only actions
 

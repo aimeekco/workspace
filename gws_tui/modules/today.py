@@ -45,7 +45,7 @@ class TodayDashboard:
 class TodayModule(WorkspaceModule):
     id = "today"
     title = "Today"
-    description = "Gemini daily briefing across your workspace."
+    description = "Antigravity daily briefing across your workspace."
     columns = ("Item", "Source", "When")
     empty_message = "No Today briefing available."
 

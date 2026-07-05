@@ -270,46 +270,49 @@ class CalendarModule(WorkspaceModule):
         profile_name: str,
         annotate_profile: bool,
     ) -> list[Record]:
-        calendars_response = client.run(
-            "calendar",
-            "calendarList",
-            "list",
-            params={"maxResults": 250, "showHidden": False},
-            page_all=True,
-        )
-        calendars = self._collect_items(calendars_response, "items")
-        window_start = datetime(year, month, 1, tzinfo=UTC)
-        if month == 12:
-            window_end = datetime(year + 1, 1, 1, tzinfo=UTC)
-        else:
-            window_end = datetime(year, month + 1, 1, tzinfo=UTC)
-        calendar_records: list[Record] = []
+        try:
+            calendars_response = client.run(
+                "calendar",
+                "calendarList",
+                "list",
+                params={"maxResults": 250, "showHidden": False},
+                page_all=True,
+            )
+            calendars = self._collect_items(calendars_response, "items")
+            window_start = datetime(year, month, 1, tzinfo=UTC)
+            if month == 12:
+                window_end = datetime(year + 1, 1, 1, tzinfo=UTC)
+            else:
+                window_end = datetime(year, month + 1, 1, tzinfo=UTC)
+            calendar_records: list[Record] = []
 
-        ordered_calendars = sorted(
-            calendars,
-            key=lambda item: (not item.get("primary", False), item.get("summaryOverride") or item.get("summary") or ""),
-        )
-
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            batches = list(
-                executor.map(
-                    lambda calendar: self._fetch_calendar_records(
-                        client,
-                        calendar,
-                        window_start,
-                        window_end,
-                        profile_name,
-                        annotate_profile,
-                    ),
-                    ordered_calendars[:6],
-                )
+            ordered_calendars = sorted(
+                calendars,
+                key=lambda item: (not item.get("primary", False), item.get("summaryOverride") or item.get("summary") or ""),
             )
 
-        for batch in batches:
-            calendar_records.extend(batch)
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                batches = list(
+                    executor.map(
+                        lambda calendar: self._fetch_calendar_records(
+                            client,
+                            calendar,
+                            window_start,
+                            window_end,
+                            profile_name,
+                            annotate_profile,
+                        ),
+                        ordered_calendars[:6],
+                    )
+                )
 
-        calendar_records.sort(key=lambda record: event_sort_key(record.raw["event"]))
-        return calendar_records
+            for batch in batches:
+                calendar_records.extend(batch)
+
+            calendar_records.sort(key=lambda record: event_sort_key(record.raw["event"]))
+            return calendar_records
+        except Exception:
+            return []
 
     def month_matrix(self, year: int, month: int) -> list[list[date]]:
         return calendar_lib.Calendar(firstweekday=6).monthdatescalendar(year, month)
